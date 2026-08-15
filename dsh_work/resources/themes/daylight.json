@@ -1,0 +1,32 @@
+{
+  "name": "Daylight",
+  "type": "light",
+  "colors": {
+    "bg_primary": "#ffffff",
+    "bg_secondary": "#f6f8fa",
+    "bg_hover": "#eaeef2",
+    "text_primary": "#1f2328",
+    "text_secondary": "#59636e",
+    "text_muted": "#818b98",
+    "accent": "#0969da",
+    "accent_secondary": "#8250df",
+    "success": "#1a7f37",
+    "warning": "#9a6700",
+    "error": "#cf222e",
+    "border": "#d0d7de",
+    "border_light": "#e7ebef"
+  },
+  "background": {
+    "image": "",
+    "mask_color": "#ffffff",
+    "mask_opacity": 0.3,
+    "background_attachment": "fixed"
+  },
+  "effects": {
+    "glass_effect": false,
+    "glass_blur": 15,
+    "glass_opacity": 0.85,
+    "bubble_radius": 12,
+    "animation": "smooth"
+  }
+}

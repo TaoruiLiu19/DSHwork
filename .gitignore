@@ -1,0 +1,101 @@
+# Python 字节码 / 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 分发 / 打包
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-wheel-metadata/
+share/python-wheels/
+
+# PyInstaller
+*.manifest
+*.spec
+# 例外：本项目打包配置需纳入版本控制
+!dsh_work.spec
+
+# 单元测试 / 覆盖率
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# 翻译
+*.mo
+*.pot
+
+# Django / Flask 日志
+*.log
+
+# 虚拟环境
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 本项目：调试脚本
+_probe*.py
+_verify_*.py
+
+# 本项目：本地缓存 / 日志 / 数据
+dsh_work/logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# 本项目：PID 锁文件
+*.pid
+*.lock
+
+# 本项目：本地用户配置
+dsh_work/config.local.json
+dsh_work/config.local.*.json
+
+# 本项目：Inno Setup 编译的安装包产物（exe/几百MB，不应入库）
+installer/Output/
+
+# PyInstaller 运行期生成的报告与临时文件
+warn-*.txt
+xref-*.html
+build-pyinstaller.log
+
+# 便携运行时本地缓存（开发期偶尔会放这里调试）
+runtime/
+node/

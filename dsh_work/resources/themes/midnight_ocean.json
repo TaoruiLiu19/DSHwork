@@ -1,0 +1,32 @@
+{
+  "name": "Midnight Ocean",
+  "type": "dark",
+  "colors": {
+    "bg_primary": "#1A1B1D",
+    "bg_secondary": "#222427",
+    "bg_hover": "#2A2D31",
+    "text_primary": "#D1D3DB",
+    "text_secondary": "#9599A6",
+    "text_muted": "#666B75",
+    "accent": "#32F08C",
+    "accent_secondary": "#7BB8FF",
+    "success": "#33C192",
+    "warning": "#D27E24",
+    "error": "#F65A5A",
+    "border": "rgba(224, 226, 242, 0.1)",
+    "border_light": "rgba(224, 226, 242, 0.16)"
+  },
+  "background": {
+    "image": "",
+    "mask_color": "#000000",
+    "mask_opacity": 0.3,
+    "background_attachment": "fixed"
+  },
+  "effects": {
+    "glass_effect": true,
+    "glass_blur": 20,
+    "glass_opacity": 0.75,
+    "bubble_radius": 8,
+    "animation": "smooth"
+  }
+}
