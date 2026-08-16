@@ -99,20 +99,44 @@ class DshWorkApp:
         self._run_environment_check()
 
         # 若环境检测未通过且用户未关闭，继续进入主窗口（离线模式）
-        if not self._init_dsh_service():
-            log.warning("DSH 服务不可用，进入离线模式")
+        try:
+            if not self._init_dsh_service():
+                log.warning("DSH 服务不可用，进入离线模式")
+        except Exception:
+            log.exception("DSH 服务初始化阶段抛异常，进入离线模式")
+            self.dsh = None
 
         # Step 2: 加载主题
-        self._load_theme()
+        try:
+            self._load_theme()
+        except Exception:
+            log.exception("主题加载失败（不致命，继续启动）")
 
         # Step 3: 首次启动场景选择
         if self.config.first_run:
-            self._show_scenario_picker()
+            try:
+                self._show_scenario_picker()
+            except Exception:
+                log.exception("场景选择引导异常（跳过）")
             self.config.first_run = False
             self.config.save()
 
         # Step 4: 显示主窗口
-        self._show_main_window()
+        try:
+            self._show_main_window()
+        except Exception:
+            log.exception("主窗口显示失败，尝试弹出错误对话框")
+            try:
+                from PySide6.QtWidgets import QMessageBox
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Icon.Critical)
+                msg.setWindowTitle("DSH Work 启动失败")
+                msg.setText("主窗口初始化失败，请查看日志。")
+                msg.setDetailedText("请将日志文件发送给开发者以定位问题。\n日志目录：见 utils.logger 配置。")
+                msg.exec()
+            except Exception:
+                log.exception("错误对话框也失败了")
+            return 1
 
         return self.qt_app.exec()
 

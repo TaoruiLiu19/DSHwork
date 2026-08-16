@@ -7,7 +7,7 @@ from __future__ import annotations
 
 # ===== 应用元信息 =====
 APP_NAME = "DSH Work"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.3.0"
 ORG_NAME = "DSH Work"
 ORG_DOMAIN = "dsh.work"
 
@@ -124,7 +124,7 @@ UPDATE_CHECK_DELAY_MS = 4000
 # 首次需要时下载官方便携 Node.js 到 ~/.dsh-work/runtime/，再用其内置 npm
 # 把 @deepseek-ai/dsh 装到同目录，启动用 [node, dsh入口js] 直接拉起。
 RUNTIME_DIRNAME = "runtime"
-PORTABLE_NODE_VERSION = "v22.14.0"            # Node 22 LTS (Jod)；N-API 模块跨版本兼容
+PORTABLE_NODE_VERSION = "v24.19.0"           # Node 24 LTS (Krypton)；dsh 需 createZstdDecompress (v22.15+/v23+)
 NODE_DOWNLOAD_TIMEOUT_SEC = 180               # 便携 Node 下载超时（zip ~30MB）
 DSH_LOCAL_INSTALL_TIMEOUT_SEC = 600           # 本地 npm install dsh 超时
 NODE_DIST_BASE = "https://nodejs.org/dist"    # 官方分发站点

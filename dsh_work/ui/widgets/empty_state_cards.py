@@ -78,7 +78,7 @@ class EmptyStateCards(QWidget):
             hover_bg = "rgba(123, 184, 255, 0.12)"
         card.setStyleSheet(f"""
             QFrame#EmptyStateCard {{
-                background-color: rgba(224, 226, 242, 0.04);
+                background-color: transparent;
                 border: 1px solid {border_color};
                 border-radius: 12px;
             }}

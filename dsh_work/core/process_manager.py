@@ -323,6 +323,9 @@ class EnvironmentCheck:
     models_available: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     logs: list[str] = field(default_factory=list)  # 实时诊断日志透传
+    # 首次启动需要下载 DSH（阻塞式下载面板用）
+    need_download: bool = False
+    download_type: str = ""  # "local_runtime"（便携运行时）/ "npm_global"（npm install -g）
 
     @property
     def all_ok(self) -> bool:
@@ -609,17 +612,22 @@ class ProcessManager:
         except Exception as e:
             log.debug("刷新 PATH 失败(不致命): %s", e)
 
-    def ensure_local_runtime(self) -> bool:
+    def ensure_local_runtime(self, progress_cb=None) -> bool:
         """一键安装便携运行时（P3-2）：下载便携 Node + 本地安装 dsh，不依赖系统 npm。
 
         供启动画面"一键安装便携运行时"按钮调用。诊断日志通过 _emit_log 实时回显。
         成功后 start_dsh 会自动用本地运行时拉起 DSH，无需系统 Node/npm。
 
+        Args:
+            progress_cb: 可选的下载进度回调 (done_bytes, total_bytes)，
+                         total_bytes=0 表示未知大小。仅下载 Node 阶段会调用，
+                         npm install 阶段无精确进度（UI 用不确定模式）。
+
         Returns:
             True 表示运行时就绪（get_dsh_command() 可用）
         """
         from . import dsh_downloader
-        cmd = dsh_downloader.ensure_runtime(self._emit_log)
+        cmd = dsh_downloader.ensure_runtime(self._emit_log, progress_cb)
         if cmd:
             self._emit_log(f"便携运行时就绪: {cmd[0]}")
             return True
@@ -643,10 +651,25 @@ class ProcessManager:
         # 端口被占，校验 PID 所有权
         pid_info = self.pid_lock.read()
         if pid_info is None:
-            # 端口被占但无 PID 文件
-            self._ownership = ProcessOwnership.PORT_CONFLICT
-            log.warning("端口 %d 被占但无 PID 文件（用户手动启动的 DSH？）", C.DSH_DEFAULT_PORT)
-            return True
+            # 端口被占但无 PID 文件 → 上次崩溃残留的孤儿进程
+            # （正常退出时 stop_dsh 会写 PID 文件并清理端口；无 PID 文件说明
+            #  上次进程未走完清理流程就退出了，残留的 node/dsh 仍占用 3080。）
+            # 复用这种孤儿会导致本次启动在 init 阶段异常退出（WebSocket/会话状态不一致），
+            # 因此统一清理孤儿，由后续 start_dsh 启动全新 DSH，保证本次启动稳定。
+            self._ownership = ProcessOwnership.NOT_RUNNING
+            log.warning(
+                "端口 %d 被占但无 PID 文件，判定为上次崩溃残留孤儿，正在清理...",
+                C.DSH_DEFAULT_PORT,
+            )
+            killed = self._kill_port_owner(C.DSH_DEFAULT_PORT)
+            if killed:
+                self._emit_log(
+                    f"已清理 {killed} 个占用端口 {C.DSH_DEFAULT_PORT} 的孤儿进程（上次崩溃残留）"
+                )
+                # 清理后短暂等待端口释放（OS 回收 TIME_WAIT）
+                import time as _t
+                _t.sleep(0.5)
+            return False
 
         if self.pid_lock.is_dsh_alive():
             if pid_info.owner == "dsh-work":
@@ -831,6 +854,88 @@ class ProcessManager:
         except Exception:
             pass
 
+    def _find_port_owner_pids(self, port: int) -> list[int]:
+        """查找占用指定 TCP 端口（LISTENING）的进程 PID 列表。
+
+        Windows 用 netstat -ano，Unix 用 lsof -ti。
+        返回去重后的 PID 列表（不含当前进程自身）。
+        """
+        pids: set[int] = set()
+        my_pid = os.getpid()
+        try:
+            if os.name == "nt":
+                # netstat -ano -p TCP 输出形如：
+                #   TCP    0.0.0.0:3080      0.0.0.0:0    LISTENING    12345
+                #   TCP    [::]:3080         [::]:0      LISTENING     12345
+                r = subprocess.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True, text=True, timeout=5, shell=False,
+                )
+                if r.returncode == 0:
+                    for line in r.stdout.splitlines():
+                        parts = line.split()
+                        if len(parts) < 5:
+                            continue
+                        if "LISTENING" not in parts:
+                            continue
+                        # 本地地址列形如 0.0.0.0:3080 或 [::]:3080
+                        local = parts[1]
+                        if not local.endswith(f":{port}"):
+                            continue
+                        try:
+                            pid = int(parts[-1])
+                        except ValueError:
+                            continue
+                        if pid and pid != my_pid:
+                            pids.add(pid)
+            else:
+                # lsof -ti tcp:PORT 仅返回 PID（每行一个）
+                r = subprocess.run(
+                    ["lsof", "-ti", f"tcp:{port}"],
+                    capture_output=True, text=True, timeout=5, shell=False,
+                )
+                if r.returncode == 0:
+                    for line in r.stdout.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            pid = int(line)
+                        except ValueError:
+                            continue
+                        if pid and pid != my_pid:
+                            pids.add(pid)
+        except Exception as e:
+            log.debug("查找端口 %d 占用进程失败: %s", port, e)
+        return list(pids)
+
+    def _kill_port_owner(self, port: int, *, skip_pids: list[int] | None = None) -> int:
+        """强制终止占用指定 TCP 端口的所有进程（兜底清理孤儿）。
+
+        用于 stop_dsh 之后清理 taskkill /T 漏杀的脱离进程组子进程
+        （shell=True 启动 npx.cmd → node 时偶发）。
+        返回被终止的进程数。
+        """
+        skip = set(skip_pids or [])
+        pids = [p for p in self._find_port_owner_pids(port) if p not in skip]
+        if not pids:
+            return 0
+        killed = 0
+        for pid in pids:
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        capture_output=True, timeout=5, shell=False,
+                    )
+                else:
+                    os.kill(pid, signal.SIGKILL)
+                killed += 1
+                log.info("已终止占用端口 %d 的孤儿进程 PID=%d", port, pid)
+            except Exception as e:
+                log.debug("终止端口 %d 占用进程 PID=%d 失败: %s", port, pid, e)
+        return killed
+
     def _stream_logs(self) -> None:
         """透传 DSH 子进程 stdout/stderr 到日志回调。
 
@@ -935,6 +1040,10 @@ class ProcessManager:
 
         log_thread = getattr(self, "_log_thread", None)
 
+        # 已启动子进程的实际监听端口（dsh web 可能不占用默认 3080）
+        port_to_clean = getattr(self, "_dsh_ready_port", None) or C.DSH_DEFAULT_PORT
+        killed_pid = getattr(self._dsh_process, "pid", None) if self._dsh_process else None
+
         if self._dsh_process:
             try:
                 # 关键：Windows 下 shell=True 启动的 npx→node 必须用 taskkill /T 杀整棵树
@@ -945,6 +1054,17 @@ class ProcessManager:
                 return False
             finally:
                 self._dsh_process = None
+
+        # 兜底：清理 taskkill /T 漏杀的脱离进程组子进程
+        # （shell=True 启动 npx.cmd → node 时，node 偶尔脱离父进程组，
+        #  导致 taskkill /T 杀不到，端口 3080 仍被占 → 下次启动触发 PORT_CONFLICT）
+        try:
+            orphans = self._kill_port_owner(port_to_clean, skip_pids=[killed_pid] if killed_pid else None)
+            if orphans:
+                self._emit_log(f"已清理 {orphans} 个占用端口 {port_to_clean} 的孤儿进程")
+                log.info("stop_dsh 兜底清理孤儿进程: %d 个（端口 %d）", orphans, port_to_clean)
+        except Exception as e:
+            log.warning("兜底清理端口孤儿进程失败(不致命): %s", e)
 
         # 子进程终止后 stdout 会被关闭，日志线程通常会很快退出；这里给 2s 等待
         if log_thread is not None and log_thread.is_alive():

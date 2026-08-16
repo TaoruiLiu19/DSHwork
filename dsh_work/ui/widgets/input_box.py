@@ -33,6 +33,32 @@ from ...core.session_manager import ContextUsage, AgentStatus
 from ... import constants as C
 
 
+def _theme_colors():
+    try:
+        from ..theme.theme_manager import ThemeManager
+        tm = ThemeManager()
+        theme = tm.current
+        if theme and theme.colors:
+            return theme.colors
+    except Exception:
+        pass
+    return None
+
+
+_FALLBACK = {
+    "input_bg": "#B5BDC5",
+}
+
+
+def _palette() -> dict:
+    tc = _theme_colors()
+    if tc:
+        return {
+            "input_bg": tc.input_bg or _FALLBACK["input_bg"],
+        }
+    return dict(_FALLBACK)
+
+
 class InputBox(QWidget):
     """消息输入框。
 
@@ -162,8 +188,9 @@ class InputBox(QWidget):
             "error": "#F65A5A",
         }
         color = color_map.get(color_key, "#32F08C")
+        p = _palette()
         self._context_bar.setStyleSheet(
-            f"QProgressBar {{ background-color: rgba(224, 226, 242, 0.1); border: none; border-radius: 2px; }}"
+            f"QProgressBar {{ background-color: {p['input_bg']}; border: none; border-radius: 2px; }}"
             f"QProgressBar::chunk {{ background-color: {color}; border-radius: 2px; }}"
         )
 

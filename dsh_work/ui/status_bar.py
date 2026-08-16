@@ -28,6 +28,34 @@ from ..core.session_manager import AgentStatus, ContextUsage
 from .. import constants as C
 
 
+def _theme_colors():
+    try:
+        from .theme.theme_manager import ThemeManager
+        tm = ThemeManager()
+        theme = tm.current
+        if theme and theme.colors:
+            return theme.colors
+    except Exception:
+        pass
+    return None
+
+
+_FALLBACK = {
+    "divider": "#B5BDC5",
+    "input_bg": "#B5BDC5",
+}
+
+
+def _palette() -> dict:
+    tc = _theme_colors()
+    if tc:
+        return {
+            "divider": tc.divider or _FALLBACK["divider"],
+            "input_bg": tc.input_bg or _FALLBACK["input_bg"],
+        }
+    return dict(_FALLBACK)
+
+
 class StatusIndicator(QWidget):
     """连接状态指示灯。"""
 
@@ -150,8 +178,9 @@ class StatusBar(QWidget):
 
     @staticmethod
     def _separator() -> QLabel:
+        p = _palette()
         sep = QLabel("│")
-        sep.setStyleSheet("color: rgba(224, 226, 242, 0.1);")
+        sep.setStyleSheet(f"color: {p['divider']};")
         return sep
 
     def set_connection_status(self, mode: CompatibilityMode) -> None:
@@ -205,8 +234,9 @@ class StatusBar(QWidget):
             "error": "#F65A5A",
         }
         color = color_map.get(context.color_key, "#32F08C")
+        p = _palette()
         self._context_bar.setStyleSheet(
-            f"QProgressBar {{ background-color: rgba(224, 226, 242, 0.1); border: none; border-radius: 3px; }}"
+            f"QProgressBar {{ background-color: {p['input_bg']}; border: none; border-radius: 3px; }}"
             f"QProgressBar::chunk {{ background-color: {color}; border-radius: 3px; }}"
         )
 

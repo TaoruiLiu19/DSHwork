@@ -38,21 +38,30 @@ log = get_logger("ui.theme_manager")
 
 @dataclass
 class ThemeColors:
-    """配色方案（TraeCode 深色 token）。"""
+    """配色方案（Dark/Light 双模式通用 token，新增字段带默认值，主题文件缺省时不崩溃）。"""
 
     bg_primary: str = "#1A1B1D"
     bg_secondary: str = "#222427"
     bg_hover: str = "#2A2D31"
+    bg_card: str = "#191c2a"
     text_primary: str = "#D1D3DB"
     text_secondary: str = "#9599A6"
     text_muted: str = "#666B75"
     accent: str = "#32F08C"
+    accent_hover: str = "#33C192"
     accent_secondary: str = "#7BB8FF"
     success: str = "#33C192"
     warning: str = "#D27E24"
     error: str = "#F65A5A"
-    border: str = "rgba(224, 226, 242, 0.1)"
-    border_light: str = "rgba(224, 226, 242, 0.16)"
+    # 线条体系：组件间统一使用，不再分散硬编码 rgba(224,226,242,*)
+    border: str = "rgba(224, 226, 242, 0.10)"        # 主边框
+    border_light: str = "rgba(224, 226, 242, 0.16)"    # 选中/强线条
+    divider: str = "rgba(224, 226, 242, 0.08)"         # 面板间分隔线（顶/底栏、左/右面板）
+    gridline: str = "rgba(224, 226, 242, 0.06)"        # QTableWidget 网格线
+    input_bg: str = "rgba(255,255,255,0.04)"           # 输入框底色
+    input_border: str = "rgba(224,226,242,0.12)"       # 输入框边框
+    tab_border: str = "rgba(224,226,242,0.08)"         # QTabWidget/QTabBar 边框
+    btn_border: str = "rgba(224,226,242,0.14)"         # QPushButton 普通按钮边框
 
     @classmethod
     def from_dict(cls, data: dict) -> ThemeColors:
@@ -142,6 +151,9 @@ class Theme:
         )
 
 
+_theme_singleton: "ThemeManager | None" = None
+
+
 class ThemeManager:
     """主题管理器。
 
@@ -152,16 +164,39 @@ class ThemeManager:
     - key_name：snake_case 标识名，用于 UserConfig 持久化（如 "midnight_ocean"）
 
     set_current 时按 key_name 优先匹配，回退 display_name，避免配置与 JSON 字面名不一致。
+
+    单例：全进程共享一个实例，确保 app.py 的 set_current 能通知到所有组件
+    （MainWindow / LeftPanel 等）注册的监听器。否则各处 ThemeManager() 会创建
+    彼此独立的实例，set_current 的 listener 通知无法跨实例传递，导致切主题后
+    组件级样式不刷新。
     """
 
     # 内置主题 key → display_name 的固定映射
     BUILTIN_KEY_TO_NAME = {
         "midnight_ocean": "Midnight Ocean",
         "daylight": "Daylight",
-        "forest_green": "Forest Green",
+        "qinghua": "Qinghua",
     }
 
+    # 主题中文显示名（UI 层展示用，内部 key 不变）
+    CN_DISPLAY_NAMES = {
+        "midnight_ocean": "午夜海洋",
+        "daylight": "日光",
+        "qinghua": "青花",
+    }
+
+    def __new__(cls):
+        global _theme_singleton
+        if _theme_singleton is None:
+            _theme_singleton = super().__new__(cls)
+        return _theme_singleton
+
     def __init__(self):
+        # 单例防重入：__new__ 返回同一实例后，__init__ 会被多次调用，
+        # 用 _initialized 守卫避免重复初始化清空已加载主题 / 监听器。
+        if getattr(self, "_initialized", False):
+            return
+        self._initialized = True
         self._themes: dict[str, Theme] = {}  # display_name → Theme
         self._key_to_name: dict[str, str] = {}  # key_name(snake_case) → display_name
         self._current: Theme | None = None
@@ -191,6 +226,10 @@ class ThemeManager:
     def theme_keys(self) -> dict[str, str]:
         """key_name → display_name 映射。"""
         return self._key_to_name
+
+    def cn_display_name(self, key_name: str) -> str:
+        """获取主题中文显示名（UI 层用），无映射时回退 display_name。"""
+        return self.CN_DISPLAY_NAMES.get(key_name) or self._key_to_name.get(key_name, key_name)
 
     def load_all(self) -> dict[str, Theme]:
         """加载所有主题（内置 + 用户自定义）。"""
@@ -297,6 +336,13 @@ class ThemeManager:
 
         磨砂玻璃效果通过 QGraphicsBlurEffect 在 widget 层实现，
         QSS 只负责配色与圆角。
+
+        线条 token 分工（避免 light 主题下半透明灰"隐形"）：
+          - divider    : 顶/底栏、左右面板 border-*（面板级分隔线）
+          - tab_border : QTabWidget / QTabBar 边框
+          - btn_border : QPushButton 默认边框
+          - input_border: QTextEdit / QPlainTextEdit / QComboBox / QListWidget / QTreeWidget
+          - border     : ToolTip / MessageBubble / InlinePreview / Splitter / ScrollBar 等
         """
         t = theme or self._current
         if not t:
@@ -309,19 +355,19 @@ class ThemeManager:
         }}
         QWidget#TopBar {{
             background-color: {c.bg_secondary};
-            border-bottom: 1px solid {c.border};
+            border-bottom: 1px solid {c.divider};
         }}
         QWidget#StatusBar {{
             background-color: {c.bg_secondary};
-            border-top: 1px solid {c.border};
+            border-top: 1px solid {c.divider};
         }}
         QWidget#LeftPanel, QWidget#RightPanel {{
             background-color: {c.bg_secondary};
-            border-right: 1px solid {c.border};
+            border-right: 1px solid {c.divider};
         }}
         QWidget#RightPanel {{
             border-right: none;
-            border-left: 1px solid {c.border};
+            border-left: 1px solid {c.divider};
         }}
         QWidget#CenterPanel {{
             background-color: {c.bg_primary};
@@ -338,12 +384,12 @@ class ThemeManager:
         QPushButton {{
             background-color: {c.bg_hover};
             color: {c.text_primary};
-            border: 1px solid {c.border};
+            border: 1px solid {c.btn_border};
             border-radius: {radius}px;
             padding: 6px 14px;
         }}
         QPushButton:hover {{
-            background-color: {c.border};
+            background-color: {c.bg_secondary};
             border-color: {c.accent};
         }}
         QPushButton:pressed {{
@@ -355,7 +401,7 @@ class ThemeManager:
             border: none;
         }}
         QPushButton#Primary:hover {{
-            background-color: {c.accent_secondary};
+            background-color: {c.accent_hover};
         }}
         QPushButton#ModeWork {{
             background-color: #32F08C;
@@ -372,9 +418,9 @@ class ThemeManager:
             padding: 4px 16px;
         }}
         QTextEdit, QPlainTextEdit {{
-            background-color: {c.bg_secondary};
+            background-color: {c.input_bg};
             color: {c.text_primary};
-            border: 1px solid {c.border};
+            border: 1px solid {c.input_border};
             border-radius: {radius}px;
             padding: 8px;
         }}
@@ -384,7 +430,7 @@ class ThemeManager:
         QListWidget, QTreeWidget {{
             background-color: {c.bg_secondary};
             color: {c.text_primary};
-            border: 1px solid {c.border};
+            border: 1px solid {c.input_border};
             border-radius: {radius}px;
         }}
         QListWidget::item:hover, QTreeWidget::item:hover {{
@@ -395,9 +441,9 @@ class ThemeManager:
             color: {c.bg_primary};
         }}
         QComboBox {{
-            background-color: {c.bg_hover};
+            background-color: {c.input_bg};
             color: {c.text_primary};
-            border: 1px solid {c.border};
+            border: 1px solid {c.input_border};
             border-radius: 6px;
             padding: 4px 10px;
         }}
@@ -405,6 +451,7 @@ class ThemeManager:
             background-color: {c.bg_secondary};
             color: {c.text_primary};
             selection-background-color: {c.accent};
+            border: 1px solid {c.input_border};
         }}
         QScrollBar:vertical {{
             background: transparent;
@@ -431,7 +478,7 @@ class ThemeManager:
             min-width: 30px;
         }}
         QSplitter::handle {{
-            background-color: {c.border};
+            background-color: {c.divider};
         }}
         QSplitter::handle:hover {{
             background-color: {c.accent};
@@ -458,20 +505,20 @@ class ThemeManager:
             border-radius: {radius}px;
         }}
         QFrame#ToolCallCard {{
-            background-color: {c.bg_hover};
+            background-color: {c.bg_card};
             border: 1px solid {c.border};
             border-radius: 8px;
         }}
         QTabWidget::pane {{
             background-color: {c.bg_primary};
-            border: 1px solid {c.border};
+            border: 1px solid {c.tab_border};
             border-radius: 6px;
             top: -1px;
         }}
         QTabBar::tab {{
             background-color: {c.bg_hover};
             color: {c.text_secondary};
-            border: 1px solid {c.border};
+            border: 1px solid {c.tab_border};
             border-bottom: none;
             border-top-left-radius: 6px;
             border-top-right-radius: 6px;
@@ -484,16 +531,46 @@ class ThemeManager:
             border-color: {c.border_light};
         }}
         QTabBar::tab:hover:!selected {{
-            background-color: {c.border};
+            background-color: {c.bg_hover};
             color: {c.text_primary};
         }}
         QWidget#RightWorkPage, QWidget#RightCodePage {{
             background-color: transparent;
         }}
         QFrame#InlinePreview {{
-            background-color: {c.bg_secondary};
+            background-color: {c.bg_card};
             border: 1px solid {c.border};
             border-radius: 8px;
+        }}
+        QHeaderView::section {{
+            background-color: {c.bg_secondary};
+            color: {c.text_secondary};
+            border: none;
+            border-bottom: 1px solid {c.divider};
+            padding: 6px 8px;
+        }}
+        QTableWidget, QTableView {{
+            gridline-color: {c.gridline};
+        }}
+        QLineEdit {{
+            background-color: {c.input_bg};
+            color: {c.text_primary};
+            border: 1px solid {c.input_border};
+            border-radius: 6px;
+            padding: 5px 8px;
+        }}
+        QLineEdit:focus {{
+            border-color: {c.accent};
+        }}
+        QCheckBox {{
+            color: {c.text_primary};
+            spacing: 6px;
+        }}
+        QSpinBox, QDoubleSpinBox {{
+            background-color: {c.input_bg};
+            color: {c.text_primary};
+            border: 1px solid {c.input_border};
+            border-radius: 6px;
         }}
         """
 

@@ -83,6 +83,8 @@ class ToolCallRecord:
     started_at: float = field(default_factory=lambda: time.time())
     finished_at: float = 0.0
     error: str = ""
+    # 扩展字段：本地工具拦截执行时写入 callId / 视觉模型信息 / 耗时等
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -113,8 +115,14 @@ class SessionState:
     # 本 Turn 的 purpose / provider（从 turn_start 或发送请求时记录，可空）
     pending_purpose: str = ""
     pending_provider: str = ""
+    # 最近一轮对话的消耗（元），用于余额内联小部件展示「本轮 ¥X」
+    last_turn_cost: float = 0.0
+    # 本会话累计消耗（元），切换会话时归零
+    session_total_cost: float = 0.0
     # 消息时间戳索引：加速历史增量去重（O(1) 查询 vs 全表扫描）
     _msg_ts_index: set[float] = field(default_factory=set)
+    # 文件变更追踪器（首次调用 snapshot_files 时懒加载）
+    _file_tracker: Any = None  # FileChangeTracker | None，延迟导入避免循环
 
 
 class SessionManager:
@@ -603,6 +611,7 @@ class SessionManager:
                 v = extra_data.get(src_key)
                 if v and dst_key not in snap:
                     snap[dst_key] = str(v)
+            turn_cost = 0.0
             if snap:
                 try:
                     if hasattr(self.dsh, "usage") and self.dsh.usage is not None:
@@ -611,7 +620,7 @@ class SessionManager:
                         purpose = snap.get("purpose") or state.pending_purpose or ""
                         # 记录时间：优先取事件 msg.timestamp（秒级）转 ms，否则当前
                         ts_ms = int((msg.timestamp or time.time()) * 1000)
-                        self.dsh.usage.add_record(
+                        rec = self.dsh.usage.add_record(
                             time_ms=ts_ms,
                             model=str(model),
                             provider=str(provider),
@@ -623,51 +632,264 @@ class SessionManager:
                             reasoning_tokens=int(snap.get("reasoning_tokens", 0)),
                             finish_reason=str(snap.get("finish_reason", "")),
                         )
+                        # 计算本轮成本（auto 计价模式，与插件一致）
+                        turn_cost = self.dsh.usage.cost_of(rec, regime="auto")
                 except Exception as e:
                     log.warning("写入用量记录失败: %s", e)
                 # 消费后清空快照
                 state.pending_token_usage = {}
                 state.pending_purpose = ""
                 state.pending_provider = ""
+            # 更新会话级成本统计（用于余额内联小部件）
+            state.last_turn_cost = turn_cost
+            state.session_total_cost += turn_cost
             state.agent_status = AgentStatus.IDLE
             state.last_event_type = "turn_end"
             state.last_event_data = {"message": finalized_msg}
+
+            # 文件变更追踪：TURN_END 后自动检测本轮文件变化（仅当有基线时）
+            self._auto_scan_file_changes_after_turn(msg.session_id)
+
             self._notify(msg.session_id)
 
         elif msg.event_type == WSEventType.TOOL_CALL:
             tool_name = msg.data.get("tool", msg.data.get("name", "unknown"))
             params = msg.data.get("params") or msg.data.get("arguments", {})
+            call_id = msg.data.get("callId") or msg.data.get("call_id") or msg.data.get("id") or ""
             record = ToolCallRecord(
                 tool_name=tool_name,
                 params=params,
             )
+            if call_id:
+                record.extra["callId"] = call_id
             state.tool_calls.append(record)
             state.agent_status = AgentStatus.TOOL_EXECUTING
             state.last_event_type = "tool_call"
             state.last_event_data = {"tool_name": tool_name, "params": params}
             self._notify(msg.session_id)
 
-        elif msg.event_type == WSEventType.TOOL_RESULT:
-            # 更新最后一个同名工具调用的结果
-            tool_name = msg.data.get("tool", "")
-            status = msg.data.get("status", "success")
-            result = msg.data.get("result")
-            error = msg.data.get("error", "")
-            for record in reversed(state.tool_calls):
-                if record.tool_name == tool_name and record.status == "running":
-                    record.status = status
-                    record.result = result
-                    record.error = error
-                    record.finished_at = time.time()
-                    break
-            state.last_event_type = "tool_result"
-            state.last_event_data = {
-                "tool_name": tool_name,
-                "status": status,
-                "result": result,
-                "error": error,
-            }
-            self._notify(msg.session_id)
+            # ---- 客户端本地工具拦截执行 ----
+            self._maybe_run_local_tool(msg.session_id, tool_name, params, call_id, record)
+
+        else:
+            # 前面的大 if/elif 链没有匹配：处理 TOOL_RESULT / STEP_START / STEP_END /
+            # TOKEN_USAGE / ERROR 等事件。拆独立方法是为了避免与"客户端本地工具拦截"
+            # 的多个方法体混排，引起缩进/作用域错乱。
+            self._route_remaining_ws_events(msg)
+
+    # =========================================================================
+    #  客户端本地工具拦截（外置视觉、文件追踪等工具在客户端侧执行）
+    # =========================================================================
+
+    def _maybe_run_local_tool(self, session_id: str, tool_name: str,
+                              params: dict, call_id: str,
+                              record: ToolCallRecord) -> None:
+        """判断工具是否为客户端本地工具，是则异步执行并回写结果。
+
+        本地工具完成后的回传策略：
+          1. 优先尝试 Typert: session.submitToolResult / tools.submit（若 DSH 支持）
+          2. 不支持时回退到 session.updateQueue，把工具结果以规范化提示追加到对话队列，
+             让 Agent 下一轮能读取结果继续推理
+          3. 无论是否成功回传 RPC，都会写入 ToolCallRecord 并通过 TOOL_RESULT 事件通知 UI
+        """
+        # 目前仅支持 inspect_image（外置视觉）
+        local_tools = {"inspect_image"}
+        if tool_name not in local_tools:
+            return
+
+        if tool_name == "inspect_image":
+            self._run_inspect_image(session_id, params, call_id, record)
+
+    def _run_inspect_image(self, session_id: str, params: dict,
+                           call_id: str, record: ToolCallRecord) -> None:
+        """异步执行 inspect_image 本地工具。"""
+        # 懒加载，避免 import 循环
+        from ..tools.inspect_image import InspectImageResult, inspect_image_async
+
+        image = params.get("image") or params.get("path") or params.get("url") or ""
+        prompt = params.get("prompt") or params.get("question") or ""
+        detail = params.get("detail") or "auto"
+
+        if not image:
+            self._finish_local_tool(
+                session_id, "inspect_image", call_id, record,
+                ok=False, error="参数缺失：需要 image（本地路径或 URL）",
+                result_summary=None,
+            )
+            return
+
+        def on_done(r: InspectImageResult) -> None:
+            self._finish_local_tool(
+                session_id, "inspect_image", call_id, record,
+                ok=r.ok,
+                error=r.error,
+                result_summary=r.summary,
+                extra={
+                    "description": r.description,
+                    "image_source": r.image_source,
+                    "model": r.model,
+                    "elapsed_ms": r.elapsed_ms,
+                    "tokens_in": r.tokens_in,
+                    "tokens_out": r.tokens_out,
+                },
+            )
+
+        try:
+            inspect_image_async(on_done, image=image, prompt=prompt, detail=detail)
+        except Exception as e:
+            log.error("启动 inspect_image 失败: %s", e)
+            self._finish_local_tool(
+                session_id, "inspect_image", call_id, record,
+                ok=False, error=f"启动本地工具失败: {e}", result_summary=None,
+            )
+
+    def _finish_local_tool(self, session_id: str, tool_name: str, call_id: str,
+                           record: ToolCallRecord, *,
+                           ok: bool, error: str = "",
+                           result_summary: str | None = None,
+                           extra: dict | None = None) -> None:
+        """本地工具完成后：写状态、通知 UI、并把结果回传给 DSH。"""
+        state = self._get_state(session_id)
+        if state is None:
+            return
+
+        status_txt = "success" if ok else "error"
+        # 1) 更新 ToolCallRecord
+        try:
+            record.status = status_txt
+            record.error = error or ""
+            if result_summary is not None:
+                record.result = result_summary
+            record.finished_at = time.time()
+            if extra:
+                record.extra.update(extra)
+        except Exception as e:
+            log.warning("更新 ToolCallRecord 失败: %s", e)
+
+        # 2) 构造 TOOL_RESULT 事件通知 UI（使工具卡片刷新）
+        state.last_event_type = "tool_result"
+        state.last_event_data = {
+            "tool_name": tool_name,
+            "status": status_txt,
+            "result": record.result,
+            "error": error or "",
+            "callId": call_id,
+            **(extra or {}),
+        }
+        self._notify(session_id)
+
+        # 3) 回传结果给 DSH（让 Agent 能继续推理）
+        self._submit_tool_result_to_dsh(
+            session_id, tool_name, call_id,
+            ok=ok, error=error, result=result_summary,
+        )
+
+    def _submit_tool_result_to_dsh(self, session_id: str, tool_name: str,
+                                   call_id: str, *, ok: bool, error: str,
+                                   result: str | None) -> None:
+        """把本地工具结果回传给 DSH。
+
+        优先使用 Typert RPC 的 tools.submit / session.submitToolResult；
+        方法不存在时回退到 session.updateQueue（把结果当额外消息追加）。
+        """
+        if self.dsh is None or self.dsh.http is None:
+            return
+
+        normalized_result = result if result is not None else (
+            f"[本地工具 {tool_name} 执行{'成功' if ok else '失败'}]"
+            + (f" 原因: {error}" if error else "")
+        )
+
+        # 尝试 1: tools.submit（可能是 DSH Typert 原生工具回传方法）
+        tried_methods: list[tuple[str, dict]] = [
+            ("tools.submit", {
+                "sessionId": session_id,
+                "tool": tool_name,
+                "callId": call_id,
+                "status": "success" if ok else "error",
+                "result": normalized_result,
+                "error": error or "",
+            }),
+            # 尝试 2: session.submitToolResult
+            ("session.submitToolResult", {
+                "sessionId": session_id,
+                "callId": call_id,
+                "tool": tool_name,
+                "status": "success" if ok else "error",
+                "result": normalized_result,
+                "error": error or "",
+            }),
+        ]
+
+        last_exc: Exception | None = None
+        for method_name, payload in tried_methods:
+            try:
+                self.dsh.http.call(method_name, payload)
+                log.info("已通过 %s 回传本地工具结果: %s", method_name, tool_name)
+                return
+            except Exception as e:
+                last_exc = e
+                # method-not-found / 其他错误 → 继续尝试下一个
+                continue
+
+        # 回退：updateQueue → 把结果以规范化格式注入对话
+        fallback_text = (
+            f"\n\n[本地工具执行结果]\n工具: {tool_name}\n"
+            f"状态: {'成功' if ok else '失败'}\n"
+            + (f"错误: {error}\n" if error else "")
+            + f"输出:\n{normalized_result}\n"
+        )
+        try:
+            self.dsh.update_queue(session_id, fallback_text)
+            log.info("已通过 updateQueue 回传本地工具结果: %s", tool_name)
+        except Exception as e2:
+            log.error(
+                "本地工具结果回传 DSH 失败（RPC最后异常=%s, fallback=%s）",
+                last_exc, e2,
+            )
+
+    def _handle_tool_result(self, msg: WSEventMessage) -> None:
+        """处理 DSH 侧发回的 TOOL_RESULT 事件（服务端侧工具执行结果）。"""
+        state = self._get_state(msg.session_id)
+        if state is None:
+            return
+        # 更新最后一个同名工具调用的结果
+        tool_name = msg.data.get("tool", "")
+        status = msg.data.get("status", "success")
+        result = msg.data.get("result")
+        error = msg.data.get("error", "")
+        for record in reversed(state.tool_calls):
+            if record.tool_name == tool_name and record.status == "running":
+                record.status = status
+                record.result = result
+                record.error = error
+                record.finished_at = time.time()
+                break
+        state.last_event_type = "tool_result"
+        state.last_event_data = {
+            "tool_name": tool_name,
+            "status": status,
+            "result": result,
+            "error": error,
+        }
+        self._notify(msg.session_id)
+
+    # =====================================================================
+    #  _on_ws_message() 剩余事件分支（接 TOOL_CALL 本地工具拦截之后）
+    # =====================================================================
+
+    def _route_remaining_ws_events(self, msg: WSEventMessage) -> None:
+        """_on_ws_message 中 TOOL_CALL 之后的事件路由。
+
+        单独拆方法是为了避免把本地工具拦截方法的函数体与大段 elif 链混排，
+        导致缩进错乱。等价的 elif 链如下。
+        """
+        state = self._get_state(msg.session_id)
+        if state is None:
+            return
+
+        if msg.event_type == WSEventType.TOOL_RESULT:
+            self._handle_tool_result(msg)
 
         elif msg.event_type == WSEventType.STEP_START:
             state.current_step = msg.data.get("step", state.current_step + 1)
@@ -736,3 +958,113 @@ class SessionManager:
         if state.agent_status == AgentStatus.ERROR:
             return "Error"
         return "Idle"
+
+    # =====================================================================
+    #  文件变更追踪 + 一键还原（外接 UI 面板 / 工具卡）
+    # =====================================================================
+
+    def _get_file_tracker(self, session_id: str | None = None,
+                          create: bool = True) -> Any:  # FileChangeTracker | None
+        """获取指定会话的文件追踪器。create=True 时懒加载。"""
+        sid = session_id or self._current_session_id
+        if not sid:
+            return None
+        state = self._get_state(sid)
+        if state is None:
+            return None
+        if state._file_tracker is None and create:
+            from .file_tracker import FileChangeTracker
+            tracker = FileChangeTracker(session_id=sid)
+            tracker.load_persistent()  # 崩溃重启恢复
+            state._file_tracker = tracker
+        return state._file_tracker
+
+    def snapshot_files(self, paths, session_id: str | None = None) -> int:
+        """为指定路径建立基线快照。返回新建立的快照文件数。"""
+        tracker = self._get_file_tracker(session_id, create=True)
+        if tracker is None:
+            return 0
+        n = tracker.snapshot(paths)
+        # 建立基线后立即扫描一次，便于 UI 渲染列表
+        tracker.scan_changed()
+        self._notify_any(session_id)
+        return n
+
+    def scan_file_changes(self, session_id: str | None = None):
+        """返回 list[ChangedFile]（按路径排序）。"""
+        tracker = self._get_file_tracker(session_id, create=False)
+        if tracker is None:
+            return []
+        return tracker.scan_changed()
+
+    def get_file_changes(self, session_id: str | None = None):
+        """UI 刷新用：返回上次 scan 结果（不重新扫描磁盘）。"""
+        tracker = self._get_file_tracker(session_id, create=False)
+        if tracker is None:
+            return []
+        return tracker.get_last_changes()
+
+    def diff_file(self, path: str, session_id: str | None = None) -> str:
+        """返回单文件统一 diff（基线 vs 当前）。"""
+        tracker = self._get_file_tracker(session_id, create=False)
+        if tracker is None:
+            return ""
+        return tracker.diff_lines(path)
+
+    def restore_file(self, path: str, force: bool = False,
+                     session_id: str | None = None) -> tuple[bool, str]:
+        """还原单文件。返回 (是否成功, 信息/错误文本)。"""
+        tracker = self._get_file_tracker(session_id, create=False)
+        if tracker is None:
+            return False, "无基线快照（请先对该文件 snapshot_files）。"
+        from .file_tracker import ConflictError
+        try:
+            tracker.restore_one(path, force=force)
+        except ConflictError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, f"还原失败: {e}"
+        self._notify_any(session_id)
+        return True, "已还原。"
+
+    def restore_all_files(self, force: bool = False,
+                          session_id: str | None = None
+                          ) -> tuple[int, list[tuple[str, str]]]:
+        """一键还原全部扫描到的变更。返回 (成功数, [(path, err), ...])。"""
+        tracker = self._get_file_tracker(session_id, create=False)
+        if tracker is None:
+            return 0, [("", "无基线快照。")]
+        ok, errors = tracker.restore_all(force=force)
+        self._notify_any(session_id)
+        return ok, errors
+
+    def add_file_change_listener(self, cb, session_id: str | None = None) -> None:
+        """注册文件变更监听器（scan_changed 检测到变更时触发）。"""
+        tracker = self._get_file_tracker(session_id, create=True)
+        if tracker is not None:
+            tracker.add_listener(cb)
+
+    def clear_file_tracker(self, session_id: str | None = None) -> None:
+        tracker = self._get_file_tracker(session_id, create=False)
+        if tracker is not None:
+            tracker.clear()
+
+    def _notify_any(self, session_id: str | None) -> None:
+        sid = session_id or self._current_session_id
+        if sid:
+            self._notify(sid)
+
+    def _auto_scan_file_changes_after_turn(self, session_id: str) -> None:
+        """TURN_END 后：如果本会话已做过基线快照，就自动做一次变更扫描。
+
+        扫描到变更时通过 file_tracker listener 广播，UI 侧面板能即时刷新列表。
+        """
+        tracker = self._get_file_tracker(session_id, create=False)
+        if tracker is None:
+            return
+        try:
+            changes = tracker.scan_changed()
+            if changes:
+                log.info("本轮检测到 %d 个文件变更（session=%s）", len(changes), session_id)
+        except Exception as e:
+            log.warning("TURN_END 自动扫描文件变更失败: %s", e)

@@ -1,1430 +1,1768 @@
-"""用量与消耗面板（移植自 dsh-usage-plugin Web UI）。
+"""用量与消耗面板。
 
-子页签：
-  - 概览：总调用、总消耗、累计 token、时段分布卡片
-  - 用量日历：按月查看每日用量热力图（按消耗或调用数着色）
-  - 记录列表：完整记录表格 + 快捷筛选 + 自定义日期 + 导入导出
-  - 价格表：基础价 / 峰谷价展示与编辑，一键恢复默认
-  - 余额查询：复用 DSH Work 双通道 BalanceClient（而非插件的单通道）
-
-风格：磨砂玻璃、TRAE 深色 token 配色，与主界面一致。
+包含四个标签页：
+- 概览：统计卡片 + 调用明细表
+- 模型价格：各模型层级峰谷定价编辑
+- 计费设置：日期范围筛选 + 按层级聚合 + CSV 导出
+- 设置：API Key 临时记忆、主题切换、DSH 路径
 """
 
 from __future__ import annotations
 
 import calendar
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal, QDate, QTimer
-from PySide6.QtGui import QColor, QPainter, QBrush, QFont, QPen
+from PySide6.QtCore import Qt, QDate, QTimer
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QComboBox,
-    QDateEdit, QFileDialog, QMessageBox, QDoubleSpinBox, QGridLayout,
-    QLineEdit, QSizePolicy, QScrollArea, QAbstractItemView,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QComboBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QFrame,
+    QDateEdit,
+    QDoubleSpinBox,
+    QLineEdit,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QAbstractItemView,
+    QTabWidget,
+    QTabBar,
+    QSpinBox,
+    QGroupBox,
+    QFormLayout,
+    QFileDialog,
+    QMessageBox,
+    QSizePolicy,
+    QSpacerItem,
+    QLayout,
+    QScrollArea,
 )
 
-from ...core.usage_tracker import UsageTracker, UsageRecord, DayAggregate, PRICE_MODELS
-from ...api.balance_client import BalanceClient, BalanceResult
+from ...core.usage_tracker import UsageTracker, PRICE_MODELS
+from ..theme.theme_manager import ThemeManager
 from ...utils.logger import get_logger
 
 log = get_logger("ui.usage_panel")
 
 
-# ===== 主题感知颜色（由 _apply_theme_colors() 原地更新）=====
-_CARD_BG = "rgba(30, 33, 42, 0.75)"
-_CARD_BORDER = "rgba(224, 226, 242, 0.08)"
-_ACCENT = "#32F08C"
-_WARNING = "#FFB454"
-_ERROR = "#F65A5A"
-_TEXT = "#E0E2F2"
-_MUTED = "#9599A6"
-_DIM = "#666B75"
-_TRAE_BLUE = "#387BFF"
-_BG_PRIMARY = "#1A1B1D"
-_BG_SECONDARY = "#222427"
-_BG_HOVER = "#2A2D31"
+# ===== 模块级颜色 Token（由 _apply_theme_colors 填充）=====
+
+_ACCENT: str = "#7BB8FF"
+_WARNING: str = "#FF8F3D"
+_ERROR: str = "#FF5C5C"
+_TEXT: str = "#E0E2F2"
+_MUTED: str = "#9599A6"
+_DIM: str = "#6B6F7D"
+_TRAE_BLUE: str = "#387BFF"
+_BG_PRIMARY: str = "#0f1118"
+_BG_SECONDARY: str = "#171a26"
+_BG_HOVER: str = "#1e2233"
+_CARD_BG: str = "#191c2a"
+_CARD_BORDER: str = "rgba(224, 226, 242, 0.10)"
+
+# 新增行 Token
+_SOFT_BG: str = "rgba(255, 255, 255, 0.04)"
+_HARD_BG: str = "rgba(224, 226, 242, 0.16)"
+_INPUT_BORDER: str = "rgba(224, 226, 242, 0.12)"
+_BTN_BORDER: str = "rgba(224, 226, 242, 0.14)"
+_PANEL_BORDER: str = "rgba(224, 226, 242, 0.10)"
+_TAB_BORDER: str = "rgba(224, 226, 242, 0.08)"
+_CELL_DIVIDER: str = "rgba(224, 226, 242, 0.08)"
+_GRIDLINE: str = "rgba(224, 226, 242, 0.06)"
+_TAB_PANE_BG: str = "rgba(30,33,42,0.5)"
+_CODE_INPUT_BORDER: str = "rgba(224, 226, 242, 0.12)"
+
+
+# ===== 工具函数 =====
+
+def _rgba_from_hex(hex_color: str, alpha: float = 1.0) -> str:
+    """将 #RRGGBB / #RRGGBBAA 转 rgba(r,g,b,a) 字符串。"""
+    h = hex_color.lstrip("#")
+    if len(h) == 6:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    if len(h) == 8:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        a = int(h[6:8], 16) / 255.0
+        return f"rgba({r},{g},{b},{round(a * alpha, 3)})"
+    return hex_color
 
 
 def _apply_theme_colors(theme) -> None:
-    """从 Theme 对象原地更新模块级颜色变量。"""
-    global _CARD_BG, _CARD_BORDER, _ACCENT, _WARNING, _ERROR
-    global _TEXT, _MUTED, _DIM, _TRAE_BLUE, _BG_PRIMARY, _BG_SECONDARY, _BG_HOVER
+    """从 ThemeColors dataclass 填充模块级颜色 Token。"""
+    global _ACCENT, _WARNING, _ERROR, _TEXT, _MUTED, _DIM, _TRAE_BLUE
+    global _BG_PRIMARY, _BG_SECONDARY, _BG_HOVER, _CARD_BG, _CARD_BORDER
+    global _SOFT_BG, _HARD_BG, _INPUT_BORDER, _BTN_BORDER, _PANEL_BORDER
+    global _TAB_BORDER, _CELL_DIVIDER, _GRIDLINE, _TAB_PANE_BG, _CODE_INPUT_BORDER
+
     c = theme.colors
-    _ACCENT = c.accent
-    _WARNING = c.warning
-    _ERROR = c.error
-    _TEXT = c.text_primary
-    _MUTED = c.text_secondary
-    _DIM = c.text_muted
-    _TRAE_BLUE = c.accent_secondary
-    _BG_PRIMARY = c.bg_primary
-    _BG_SECONDARY = c.bg_secondary
-    _BG_HOVER = c.bg_hover
-    # card_bg = bg_secondary 带 0.75 透明度
-    r = int(c.bg_secondary[1:3], 16)
-    g = int(c.bg_secondary[3:5], 16)
-    b = int(c.bg_secondary[5:7], 16)
-    _CARD_BG = f"rgba({r}, {g}, {b}, 0.75)"
-    _CARD_BORDER = c.border
+
+    _ACCENT = c.accent or "#7BB8FF"
+    _WARNING = c.warning or "#FF8F3D"
+    _ERROR = c.error or "#FF5C5C"
+    _TEXT = c.text_primary or "#E0E2F2"
+    _MUTED = c.text_secondary or "#9599A6"
+    _DIM = c.text_muted or "#6B6F7D"
+    _TRAE_BLUE = c.accent_secondary or "#387BFF"
+    _BG_PRIMARY = c.bg_primary or "#0f1118"
+    _BG_SECONDARY = c.bg_secondary or "#171a26"
+    _BG_HOVER = c.bg_hover or "#1e2233"
+
+    # _CARD_BG = bg_secondary rgba 化（alpha=0.75）
+    _CARD_BG = _rgba_from_hex(_BG_SECONDARY, 0.75)
+    _CARD_BORDER = c.border or "rgba(224, 226, 242, 0.10)"
+
+    # 新增行 Token
+    _SOFT_BG = c.input_bg if c.input_bg else c.bg_hover
+    _HARD_BG = c.border_light or "rgba(224, 226, 242, 0.16)"
+    _INPUT_BORDER = c.input_border if c.input_border else c.border
+    _BTN_BORDER = c.btn_border if c.btn_border else c.border_light
+    _PANEL_BORDER = c.border or "rgba(224, 226, 242, 0.10)"
+    _TAB_BORDER = c.tab_border if c.tab_border else c.border
+    _CELL_DIVIDER = c.divider if c.divider else c.border
+    _GRIDLINE = c.gridline if c.gridline else c.border
+
+    # _TAB_PANE_BG：暗色用半透明，亮色用 bg_card 或 bg_secondary
+    if theme.is_dark:
+        _TAB_PANE_BG = "rgba(30,33,42,0.5)"
+    else:
+        _TAB_PANE_BG = c.bg_card or c.bg_secondary or _BG_SECONDARY
+
+    _CODE_INPUT_BORDER = c.input_border if c.input_border else c.border_light
 
 
-def _fmt_money(n: float) -> str:
-    if n <= 0:
+def _fmt_money(amount: float) -> str:
+    """格式化金额字符串。
+
+    - <= 0 → "0.00"
+    - >0 且 <0.01 → "<0.01"
+    - < 1 → ".2f" 精确到 0.000 分（保留 3 位小数）
+    - >= 1 → ".2f" 保留 2 位小数
+    """
+    if amount <= 0:
         return "0.00"
-    if n < 0.01:
-        return f"{n:.4f}"
-    if n < 1:
-        return f"{n:.3f}"
-    return f"{n:.2f}"
+    if amount < 0.01:
+        return "<0.01"
+    if amount < 1:
+        return f"{amount:.3f}"
+    return f"{amount:.2f}"
 
 
-def _fmt_int(n: int) -> str:
-    return f"{n:,}"
+def _fmt_int(value: int) -> str:
+    """千分位格式化整数。"""
+    try:
+        return f"{int(value):,}"
+    except (ValueError, TypeError):
+        return str(value)
 
 
 def _bj_month_range(year: int, month: int) -> tuple[int, int]:
-    """返回北京时间该月第一天 00:00 和最后一天 23:59 的 UTC 毫秒。"""
-    # 本月 1 号 00:00 北京 = 上月 31 号 16:00 UTC
-    first_bj = time.mktime((year, month, 1, 0, 0, 0, 0, 0, -1))
+    """返回北京时间该月 [月初 00:00, 月末 23:59:59] 的 UTC 毫秒范围。"""
+    bj_tz_offset_ms = 8 * 3600 * 1000
     last_day = calendar.monthrange(year, month)[1]
-    last_bj_end = time.mktime((year, month, last_day, 23, 59, 59, 0, 0, -1))
-    return int(first_bj * 1000 - 8 * 3600 * 1000), int(last_bj_end * 1000 - 8 * 3600 * 1000)
+    # 北京时间 Y-M-1 00:00:00 → UTC 减 8 小时
+    start_struct = time.strptime(f"{year}-{month:02d}-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+    start_utc_ms = int(time.mktime(start_struct)) * 1000 - bj_tz_offset_ms
+    # 北京时间 Y-M-last_day 23:59:59 → UTC 减 8 小时
+    end_struct = time.strptime(f"{year}-{month:02d}-{last_day:02d} 23:59:59", "%Y-%m-%d %H:%M:%S")
+    end_utc_ms = int(time.mktime(end_struct)) * 1000 - bj_tz_offset_ms
+    return start_utc_ms, end_utc_ms
 
 
 def _card_stylesheet() -> str:
+    """生成 _Card 组件的 QSS（引用模块颜色 Token）。"""
     return (
-        "QFrame#UsageCard {"
-        f"  background-color: {_CARD_BG};"
+        f"QFrame#UsageCard {{"
+        f"  background: {_CARD_BG};"
         f"  border: 1px solid {_CARD_BORDER};"
-        "  border-radius: 12px;"
-        "}"
-        f"QLabel#CardTitle {{ color: {_MUTED}; font-size: 12px; }}"
-        f"QLabel#CardValue {{ color: {_TEXT}; font-size: 22px; font-weight: 700; }}"
-        f"QLabel#CardSub   {{ color: {_DIM}; font-size: 11px; }}"
+        f"  border-radius: 12px;"
+        f"}}"
     )
 
 
+# ===== _Card 组件 =====
+
 class _Card(QFrame):
-    def __init__(self, title: str, value: str, sub: str = "", parent=None):
+    """概览统计卡片：标题 + 主数值 + 副标题。"""
+
+    def __init__(self, title: str, value: str = "0", sub: str = "", parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("UsageCard")
-        self.setStyleSheet(_card_stylesheet())
-        self.setMinimumHeight(88)
+        self.setMinimumHeight(100)
+        self._title_text = title
+        self._value_text = value
+        self._sub_text = sub
+
+        self._setup_ui()
+        self.apply_theme()
+
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(4)
-        t = QLabel(title)
-        t.setObjectName("CardTitle")
-        layout.addWidget(t)
-        self._value_lbl = QLabel(value)
-        self._value_lbl.setObjectName("CardValue")
-        layout.addWidget(self._value_lbl)
-        self._sub_lbl = QLabel(sub)
-        self._sub_lbl.setObjectName("CardSub")
-        layout.addWidget(self._sub_lbl)
+
+        self._title_label = QLabel(self._title_text)
+        self._title_label.setObjectName("CardTitle")
+        self._title_label.setStyleSheet(
+            f"color: {_MUTED}; font-size: 12px; font-weight: 500;"
+        )
+        layout.addWidget(self._title_label)
+
+        self._value_label = QLabel(self._value_text)
+        self._value_label.setObjectName("CardValue")
+        self._value_label.setStyleSheet(
+            f"color: {_TEXT}; font-size: 22px; font-weight: 700;"
+        )
+        layout.addWidget(self._value_label)
+
+        self._sub_label = QLabel(self._sub_text)
+        self._sub_label.setObjectName("CardSub")
+        self._sub_label.setStyleSheet(
+            f"color: {_DIM}; font-size: 11px; margin-top: 2px;"
+        )
+        layout.addWidget(self._sub_label)
         layout.addStretch()
 
-    def set_value(self, value: str, sub: str = "") -> None:
-        self._value_lbl.setText(value)
-        if sub:
-            self._sub_lbl.setText(sub)
+    def set_value(self, value: str) -> None:
+        self._value_text = value
+        self._value_label.setText(value)
 
-    def apply_theme(self, theme) -> None:
+    def set_sub(self, sub: str) -> None:
+        self._sub_text = sub
+        self._sub_label.setText(sub)
+
+    def set_value_color(self, color: str) -> None:
+        self._value_label.setStyleSheet(
+            f"color: {color}; font-size: 22px; font-weight: 700;"
+        )
+
+    def apply_theme(self, theme=None) -> None:
+        """应用主题到卡片样式与内部标签。"""
         self.setStyleSheet(_card_stylesheet())
+        self._title_label.setStyleSheet(
+            f"color: {_MUTED}; font-size: 12px; font-weight: 500;"
+        )
+        self._value_label.setStyleSheet(
+            f"color: {_TEXT}; font-size: 22px; font-weight: 700;"
+        )
+        self._sub_label.setStyleSheet(
+            f"color: {_DIM}; font-size: 11px; margin-top: 2px;"
+        )
 
 
-# ============================================================
-# 子页签 1：概览
-# ============================================================
+# ===== _OverviewTab =====
+
 class _OverviewTab(QWidget):
-    def __init__(self, tracker: UsageTracker, parent=None):
+    """用量概览页：筛选 + 4 张统计卡片 + 调用明细表。"""
+
+    _PRESETS = ["今日", "近 7 天", "近 30 天", "全部"]
+
+    def __init__(self, tracker: UsageTracker, parent: QWidget | None = None):
         super().__init__(parent)
         self._tracker = tracker
+        self._current_preset_idx: int = 2  # 默认「近 30 天」
         self._setup_ui()
-        self.refresh()
+
+        # 连接 tracker 变化通知（优先用 add_listener 回调机制）
+        try:
+            if hasattr(self._tracker, "add_listener"):
+                self._tracker.add_listener(self.refresh)
+        except Exception:
+            pass
+
+    # ---- UI ----
 
     def _setup_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
 
-        # 顶部标题
-        self._title = QLabel("用量概览")
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        root.addWidget(self._title)
+        # 标题行 + 筛选
+        header_row = QHBoxLayout()
+        header_row.setSpacing(12)
 
-        # 快捷筛选条
-        filter_row = QHBoxLayout()
-        filter_row.setSpacing(8)
-        self._preset = QComboBox()
-        self._preset.addItems(["今日", "近 7 天", "近 30 天", "全部"])
-        self._preset.setCurrentIndex(2)
-        self._preset.currentIndexChanged.connect(self.refresh)
-        self._preset.setStyleSheet(
-            "QComboBox { padding: 4px 10px; background: rgba(224,226,242,0.05);"
-            f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; }}"
+        title_lbl = QLabel("用量概览")
+        title_lbl.setStyleSheet(
+            f"color: {_TEXT}; font-size: 18px; font-weight: 700;"
         )
-        filter_row.addWidget(QLabel("时间范围："))
-        filter_row.addWidget(self._preset)
-        filter_row.addStretch()
-        root.addLayout(filter_row)
+        header_row.addWidget(title_lbl)
+        header_row.addStretch()
 
-        # 卡片网格 2x3
-        grid = QGridLayout()
-        grid.setSpacing(12)
-        self._c_calls = _Card("总调用次数", "0", "次")
-        self._c_cost = _Card("累计消耗", "¥ 0.00", "元（按自动计价）")
-        self._c_peak = _Card("峰时调用占比", "0%", "高峰 9-12 / 14-18")
-        self._c_input = _Card("输入未命中 token", "0", "")
-        self._c_hit = _Card("缓存读取 token", "0", "")
-        self._c_output = _Card("输出 token", "0", "")
-        grid.addWidget(self._c_calls, 0, 0)
-        grid.addWidget(self._c_cost, 0, 1)
-        grid.addWidget(self._c_peak, 0, 2)
-        grid.addWidget(self._c_input, 1, 0)
-        grid.addWidget(self._c_hit, 1, 1)
-        grid.addWidget(self._c_output, 1, 2)
-        root.addLayout(grid)
+        filter_lbl = QLabel("时间范围：")
+        filter_lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+        header_row.addWidget(filter_lbl)
 
-        # 月度消耗趋势（简化：按最近 6 个月柱状图，用 QLabel 模拟）
-        self._trend_title = QLabel("最近 6 个月消耗趋势")
-        self._trend_title.setStyleSheet(f"color: {_TEXT}; font-size: 14px; font-weight: 600; margin-top: 12px;")
-        root.addWidget(self._trend_title)
-        self._trend = _TrendBars()
-        root.addWidget(self._trend)
+        self._filter_combo = QComboBox()
+        self._filter_combo.addItems(self._PRESETS)
+        self._filter_combo.setCurrentIndex(self._current_preset_idx)
+        self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        header_row.addWidget(self._filter_combo)
 
-        root.addStretch()
+        header_wrap = QWidget()
+        header_wrap.setLayout(header_row)
+        layout.addWidget(header_wrap)
 
-    def _preset_range(self) -> tuple[int | None, int | None]:
+        # 卡片 2x2 网格
+        cards_grid = QGridLayout()
+        cards_grid.setSpacing(12)
+
+        self._card_today = _Card("今日消耗", "0.00", "¥ 人民币 · 自动计价")
+        self._card_month = _Card("30 日累计", "0.00", "¥ 人民币 · 近 30 天")
+        self._card_calls = _Card("总消息数", "0", "累计对话轮次")
+        self._card_tokens = _Card("总 Token 量", "0", "输入 + 缓存命中 + 输出")
+
+        cards_grid.addWidget(self._card_today, 0, 0)
+        cards_grid.addWidget(self._card_month, 0, 1)
+        cards_grid.addWidget(self._card_calls, 1, 0)
+        cards_grid.addWidget(self._card_tokens, 1, 1)
+        layout.addLayout(cards_grid)
+
+        # 明细表
+        table_title = QLabel("调用明细")
+        table_title.setStyleSheet(
+            f"color: {_TEXT}; font-size: 14px; font-weight: 600; margin-top: 4px;"
+        )
+        layout.addWidget(table_title)
+
+        self._table = QTableWidget()
+        self._table.setColumnCount(6)
+        self._table.setHorizontalHeaderLabels([
+            "时间", "模型", "层级", "输入", "输出", "费用 $"
+        ])
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 150)
+        self._table.setColumnWidth(1, 180)
+        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(3, 90)
+        self._table.setColumnWidth(4, 90)
+        layout.addWidget(self._table, stretch=1)
+
+        self.apply_theme()
+        QTimer.singleShot(50, self.refresh)
+
+    # ---- 事件 ----
+
+    def _on_filter_changed(self, idx: int) -> None:
+        self._current_preset_idx = idx
+        self.refresh()
+
+    def _preset_time_range(self, preset_idx: int) -> tuple[int | None, int | None]:
+        """根据筛选预设返回 (start_ms, end_ms)，None 表示不限。"""
         now_ms = int(time.time() * 1000)
-        idx = self._preset.currentIndex()
-        day_ms = 24 * 3600 * 1000
-        if idx == 0:  # 今日（北京）
-            bj_now = now_ms + 8 * 3600 * 1000
-            t = time.gmtime(bj_now / 1000)
-            start_bj = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
-            start_ms = int(start_bj * 1000) - 8 * 3600 * 1000
+        bj_now_ms = now_ms + 8 * 3600 * 1000
+        bj_struct = time.gmtime(bj_now_ms / 1000)
+        bj_year, bj_month, bj_mday = bj_struct.tm_year, bj_struct.tm_mon, bj_struct.tm_mday
+
+        if preset_idx == 0:  # 今日
+            day_start = time.strptime(
+                f"{bj_year}-{bj_month:02d}-{bj_mday:02d} 00:00:00", "%Y-%m-%d %H:%M:%S"
+            )
+            start_ms = int(time.mktime(day_start)) * 1000 - 8 * 3600 * 1000
             return start_ms, now_ms
-        if idx == 1:
-            return now_ms - 7 * day_ms, now_ms
-        if idx == 2:
-            return now_ms - 30 * day_ms, now_ms
+        if preset_idx == 1:  # 近 7 天
+            return now_ms - 7 * 86400 * 1000, now_ms
+        if preset_idx == 2:  # 近 30 天
+            return now_ms - 30 * 86400 * 1000, now_ms
         return None, None
 
+    # ---- 刷新 ----
+
     def refresh(self) -> None:
-        s, e = self._preset_range()
-        summary = self._tracker.get_summary("auto", start_ms=s, end_ms=e)
-        self._c_calls.set_value(_fmt_int(summary["total_calls"]), "次调用")
-        self._c_cost.set_value(f"¥ {_fmt_money(summary['total_cost'])}", "元（自动计价）")
-        calls = summary["total_calls"]
-        peak_pct = int(summary["peak_calls"] / calls * 100) if calls else 0
-        self._c_peak.set_value(f"{peak_pct}%", f"高峰 {summary['peak_calls']} · 空闲 {summary['off_peak_calls']}")
-        self._c_input.set_value(_fmt_int(summary["total_input_tokens"]), "输入未命中")
-        self._c_hit.set_value(_fmt_int(summary["total_cache_read_tokens"]), "缓存命中")
-        self._c_output.set_value(_fmt_int(summary["total_output_tokens"]), "输出")
-        # 6 个月趋势
-        self._trend.set_data(self._tracker)
+        """刷新卡片数据 + 表格。"""
+        self._refresh_cards()
+        self._refresh_table()
 
-    def apply_theme(self, theme) -> None:
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        self._preset.setStyleSheet(
-            "QComboBox { padding: 4px 10px; background: rgba(224,226,242,0.05);"
-            f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; }}"
-        )
-        self._trend_title.setStyleSheet(f"color: {_TEXT}; font-size: 14px; font-weight: 600; margin-top: 12px;")
-        for card in (self._c_calls, self._c_cost, self._c_peak,
-                     self._c_input, self._c_hit, self._c_output):
-            card.apply_theme(theme)
-        self._trend.apply_theme(theme)
-
-
-class _TrendBars(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(180)
-        self._data: list[tuple[str, float]] = []  # (标签, 消耗)
-
-    def set_data(self, tracker: UsageTracker) -> None:
-        """月度汇总。
-
-        优化：把 daily key (YYYY-MM-DD) 先按 YYYY-MM 聚合到 dict，避免 6 次 O(N) 前缀扫描。
-        """
-        now = time.localtime()
-        year, month = now.tm_year, now.tm_mon
-        daily = tracker.get_daily_aggregates("auto")
-
-        # 先按 YYYY-MM 做一次 O(N) 聚合
-        month_totals: dict[str, float] = {}
-        for d, agg in daily.items():
-            if len(d) >= 7:
-                mk = d[:7]  # YYYY-MM
-                month_totals[mk] = month_totals.get(mk, 0.0) + agg.auto_cost
-
-        months: list[tuple[str, float]] = []
-        for _ in range(6):
-            label = f"{year}-{month:02d}"
-            total = month_totals.get(label, 0.0)
-            months.insert(0, (label[2:], total))  # 只显示 YY-MM 的后半段
-            month -= 1
-            if month <= 0:
-                month += 12
-                year -= 1
-        self._data = months
-        self.update()
-
-    def apply_theme(self, theme) -> None:
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        pad_l, pad_r, pad_t, pad_b = 36, 12, 16, 28
-        if not self._data:
-            painter.end()
-            return
-        max_v = max((v for _, v in self._data), default=1.0)
-        if max_v <= 0:
-            max_v = 1.0
-        n = len(self._data)
-        slot = (w - pad_l - pad_r) / n
-        bar_w = min(36, slot * 0.6)
-        # 背景网格
-        painter.setPen(QPen(QColor(224, 226, 242, 20), 1))
-        for i in range(5):
-            y = pad_t + (h - pad_t - pad_b) * i / 4
-            painter.drawLine(pad_l, int(y), w - pad_r, int(y))
-        # 柱体
-        grad_color = QColor(_ACCENT)
-        painter.setPen(Qt.PenStyle.NoPen)
-        for i, (label, v) in enumerate(self._data):
-            cx = int(pad_l + slot * (i + 0.5))
-            ratio = min(v / max_v, 1.0)
-            bar_h = int((h - pad_t - pad_b) * ratio)
-            x = cx - bar_w // 2
-            y = h - pad_b - bar_h
-            # 优化：用 QLinearGradient 替代逐像素绘制循环
-            # （原代码 bar_h=100 时循环 100 次 drawRect，现在一次 drawRoundedRect）
-            if bar_h > 0:
-                from PySide6.QtGui import QLinearGradient
-                gradient = QLinearGradient(0, y, 0, y + bar_h)
-                r, g, b = grad_color.red(), grad_color.green(), grad_color.blue()
-                gradient.setColorAt(0.0, QColor(r, g, b, 80))    # 顶部透明
-                gradient.setColorAt(1.0, QColor(r, g, b, 255))   # 底部实色
-                painter.setBrush(QBrush(gradient))
-                painter.drawRoundedRect(x, y, bar_w, bar_h, 4, 4)
-            # 数值标签
-            painter.setPen(QColor(_TEXT))
-            painter.setFont(QFont("", 9))
-            v_text = f"¥{_fmt_money(v)}"
-            painter.drawText(x - 20, y - 6, bar_w + 40, 14, Qt.AlignmentFlag.AlignHCenter, v_text)
-            # x 轴标签
-            painter.setPen(QColor(_MUTED))
-            painter.drawText(x - 20, h - pad_b + 6, bar_w + 40, 18, Qt.AlignmentFlag.AlignHCenter, label)
-        # y 轴刻度
-        painter.setPen(QColor(_DIM))
-        painter.setFont(QFont("", 8))
-        for i in range(5):
-            ratio = 1 - i / 4
-            y = pad_t + (h - pad_t - pad_b) * i / 4
-            painter.drawText(4, int(y) - 6, pad_l - 8, 12, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                             f"{_fmt_money(max_v * ratio)}")
-        painter.end()
-
-
-# ============================================================
-# 子页签 2：用量日历
-# ============================================================
-class _CalendarTab(QWidget):
-    color_by_cost = Signal()
-    color_by_calls = Signal()
-
-    def __init__(self, tracker: UsageTracker, parent=None):
-        super().__init__(parent)
-        self._tracker = tracker
-        self._color_mode: str = "cost"
-        today = QDate.currentDate()
-        self._cur_year = today.year()
-        self._cur_month = today.month()
-        self._setup_ui()
-        self.refresh()
-
-    def _setup_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
-
-        title_row = QHBoxLayout()
-        self._title = QLabel("用量日历")
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        title_row.addWidget(self._title)
-        title_row.addStretch()
-
-        btn_prev = QPushButton("‹")
-        btn_next = QPushButton("›")
-        for b in (btn_prev, btn_next):
-            b.setFixedSize(28, 28)
-            b.setStyleSheet(
-                "QPushButton { background: rgba(224,226,242,0.05);"
-                f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; font-size: 16px; }}"
-                "QPushButton:hover { background: rgba(224,226,242,0.12); }"
-            )
-        btn_prev.clicked.connect(self._prev_month)
-        btn_next.clicked.connect(self._next_month)
-
-        self._month_lbl = QLabel()
-        self._month_lbl.setStyleSheet(f"color: {_TEXT}; font-size: 14px; font-weight: 600; padding: 0 12px;")
-        title_row.addWidget(btn_prev)
-        title_row.addWidget(self._month_lbl)
-        title_row.addWidget(btn_next)
-        title_row.addSpacing(16)
-
-        self._mode_combo = QComboBox()
-        self._mode_combo.addItems(["按消耗着色", "按调用数着色"])
-        self._mode_combo.setStyleSheet(
-            "QComboBox { padding: 4px 10px; background: rgba(224,226,242,0.05);"
-            f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; }}"
-        )
-        self._mode_combo.currentIndexChanged.connect(self._on_mode_change)
-        title_row.addWidget(self._mode_combo)
-        root.addLayout(title_row)
-
-        # 日历网格
-        self._grid = _CalendarGrid(self._tracker)
-        self._grid.day_clicked.connect(self._on_day_clicked)
-        root.addWidget(self._grid, stretch=1)
-
-        # 月度汇总
-        self._summary_lbl = QLabel()
-        self._summary_lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px; padding: 8px 4px;")
-        self._summary_lbl.setWordWrap(True)
-        root.addWidget(self._summary_lbl)
-
-        # 详情区
-        self._detail_title = QLabel("点击日期查看当日明细")
-        self._detail_title.setStyleSheet(f"color: {_MUTED}; font-size: 12px; margin-top: 4px;")
-        root.addWidget(self._detail_title)
-        self._detail_table = QTableWidget(0, 6)
-        self._detail_table.setHorizontalHeaderLabels(["时间(北京)", "模型", "输入", "缓存命中", "输出", "消耗(¥)"])
-        self._detail_table.verticalHeader().setVisible(False)
-        self._detail_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._detail_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._detail_table.setAlternatingRowColors(True)
-        self._detail_table.setStyleSheet(
-            "QTableWidget { background: rgba(30,33,42,0.5); border: 1px solid rgba(224,226,242,0.08);"
-            f"  border-radius: 8px; color: {_TEXT}; gridline-color: rgba(224,226,242,0.06); }}"
-            f"QHeaderView::section {{ background: rgba(224,226,242,0.04); color: {_MUTED}; padding: 6px;"
-            "  border: none; border-bottom: 1px solid rgba(224,226,242,0.1); }"
-            "QTableWidget::item { padding: 4px 8px; }"
-        )
-        self._detail_table.setFixedHeight(200)
-        root.addWidget(self._detail_table)
-
-    def _prev_month(self) -> None:
-        self._cur_month -= 1
-        if self._cur_month <= 0:
-            self._cur_month = 12
-            self._cur_year -= 1
-        self.refresh()
-
-    def _next_month(self) -> None:
-        self._cur_month += 1
-        if self._cur_month > 12:
-            self._cur_month = 1
-            self._cur_year += 1
-        self.refresh()
-
-    def _on_mode_change(self, idx: int) -> None:
-        self._color_mode = "calls" if idx == 1 else "cost"
-        self.refresh()
-
-    def _on_day_clicked(self, day_key: str) -> None:
-        # 解析 day_key = YYYY-MM-DD（北京），转 ms 范围
+    def _refresh_cards(self) -> None:
         try:
-            y, m, d = (int(x) for x in day_key.split("-"))
-        except ValueError:
-            return
-        start_bj = time.mktime((y, m, d, 0, 0, 0, 0, 0, -1))
-        end_bj = time.mktime((y, m, d, 23, 59, 59, 0, 0, -1))
-        start_ms = int(start_bj * 1000) - 8 * 3600 * 1000
-        end_ms = int(end_bj * 1000) - 8 * 3600 * 1000
-        recs = self._tracker.get_records(start_ms=start_ms, end_ms=end_ms)
-        self._detail_table.setRowCount(len(recs))
-        for i, r in enumerate(recs):
-            bj = time.strftime("%H:%M:%S", time.gmtime((r.time + 8 * 3600 * 1000) / 1000))
-            cells = [bj, r.model or "-",
-                     _fmt_int(r.input_tokens), _fmt_int(r.cache_read_tokens),
-                     _fmt_int(r.output_tokens), _fmt_money(self._tracker.cost_of(r))]
-            for c_idx, val in enumerate(cells):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if c_idx == 5:
-                    item.setForeground(QColor(_ACCENT))
-                self._detail_table.setItem(i, c_idx, item)
+            preset = self._PRESETS[self._current_preset_idx]
+            # 今日卡片
+            today_start, _ = self._preset_time_range(0)
+            today_summary = self._tracker.get_summary(start_ms=today_start)
+            today_cost = today_summary.get("total_cost", 0.0)
+            self._card_today.set_value(f"¥ {_fmt_money(today_cost)}")
+            if today_cost < 1:
+                self._card_today.set_value_color(_TRAE_BLUE)
+            elif today_cost < 10:
+                self._card_today.set_value_color(_TEXT)
+            elif today_cost < 50:
+                self._card_today.set_value_color(_WARNING)
+            else:
+                self._card_today.set_value_color(_ERROR)
 
-    def refresh(self) -> None:
-        self._month_lbl.setText(f"{self._cur_year} 年 {self._cur_month} 月")
-        self._grid.set_month(self._cur_year, self._cur_month, self._color_mode)
-        # 月度汇总
-        start_ms, end_ms = _bj_month_range(self._cur_year, self._cur_month)
-        s = self._tracker.get_summary("auto", start_ms=start_ms, end_ms=end_ms)
-        daily = self._tracker.get_daily_aggregates("auto")
-        prefix = f"{self._cur_year:04d}-{self._cur_month:02d}"
-        active_days = sum(1 for k in daily if k.startswith(prefix))
-        self._summary_lbl.setText(
-            f"本月共 {s['total_calls']} 次调用，累计消耗 ¥{_fmt_money(s['total_cost'])}，"
-            f"活跃 {active_days} 天，输入 {_fmt_int(s['total_input_tokens'])} token，"
-            f"缓存命中 {_fmt_int(s['total_cache_read_tokens'])} token，输出 {_fmt_int(s['total_output_tokens'])} token。"
-        )
+            # 30 日累计
+            month_start, _ = self._preset_time_range(2)
+            month_summary = self._tracker.get_summary(start_ms=month_start)
+            month_cost = month_summary.get("total_cost", 0.0)
+            self._card_month.set_value(f"¥ {_fmt_money(month_cost)}")
 
-    def apply_theme(self, theme) -> None:
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        self._month_lbl.setStyleSheet(f"color: {_TEXT}; font-size: 14px; font-weight: 600; padding: 0 12px;")
-        self._mode_combo.setStyleSheet(
-            "QComboBox { padding: 4px 10px; background: rgba(224,226,242,0.05);"
-            f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; }}"
-        )
-        self._summary_lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px; padding: 8px 4px;")
-        self._detail_title.setStyleSheet(f"color: {_MUTED}; font-size: 12px; margin-top: 4px;")
-        self._detail_table.setStyleSheet(
-            "QTableWidget { background: rgba(30,33,42,0.5); border: 1px solid rgba(224,226,242,0.08);"
-            f"  border-radius: 8px; color: {_TEXT}; gridline-color: rgba(224,226,242,0.06); }}"
-            f"QHeaderView::section {{ background: rgba(224,226,242,0.04); color: {_MUTED}; padding: 6px;"
-            "  border: none; border-bottom: 1px solid rgba(224,226,242,0.1); }"
-            "QTableWidget::item { padding: 4px 8px; }"
-        )
-        self._grid.apply_theme(theme)
+            # 当前筛选范围的消息数 / Token
+            s, e = self._preset_time_range(self._current_preset_idx)
+            sel_summary = self._tracker.get_summary(start_ms=s, end_ms=e)
+            calls = sel_summary.get("total_calls", 0)
+            self._card_calls.set_value(_fmt_int(calls))
 
-
-class _CalendarGrid(QWidget):
-    day_clicked = Signal(str)  # day_key = YYYY-MM-DD
-
-    _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
-
-    def __init__(self, tracker: UsageTracker, parent=None):
-        super().__init__(parent)
-        self._tracker = tracker
-        self._year = 0
-        self._month = 0
-        self._mode = "cost"
-        self._cells: list[tuple[int, int, str, DayAggregate | None]] = []  # row, col, label, agg
-        self.setMinimumHeight(320)
-
-    def set_month(self, year: int, month: int, mode: str) -> None:
-        self._year = year
-        self._month = month
-        self._mode = mode
-        self._rebuild_cells()
-        self.update()
-
-    def apply_theme(self, theme) -> None:
-        self.update()
-
-    def _rebuild_cells(self) -> None:
-        daily = self._tracker.get_daily_aggregates("auto")
-        cal = calendar.Calendar(firstweekday=0)  # 周一开头
-        self._cells = []
-        for r, week in enumerate(cal.monthdayscalendar(self._year, self._month)):
-            for c, day in enumerate(week):
-                if day == 0:
-                    self._cells.append((r, c, "", None))
-                    continue
-                key = f"{self._year:04d}-{self._month:02d}-{day:02d}"
-                agg = daily.get(key)
-                self._cells.append((r, c, str(day), agg))
-
-    def _color_for(self, agg: DayAggregate | None) -> QColor:
-        if agg is None:
-            return QColor(224, 226, 242, 18)
-        if self._mode == "cost":
-            v = agg.auto_cost
-            # 分级：0 / 0-0.1 / 0.1-1 / 1-5 / 5+
-            if v <= 0:
-                return QColor(224, 226, 242, 22)
-            if v < 0.1:
-                return QColor(50, 240, 140, 60)
-            if v < 1:
-                return QColor(50, 240, 140, 120)
-            if v < 5:
-                return QColor(56, 123, 255, 160)
-            return QColor(182, 85, 252, 200)
-        else:
-            c = agg.calls
-            if c <= 0:
-                return QColor(224, 226, 242, 22)
-            if c < 5:
-                return QColor(50, 240, 140, 60)
-            if c < 20:
-                return QColor(50, 240, 140, 120)
-            if c < 80:
-                return QColor(56, 123, 255, 160)
-            return QColor(182, 85, 252, 200)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        pad = 8
-        # 54 周标签行
-        header_h = 28
-        rows = 6
-        cols = 7
-        cell_w = (w - pad * 2) / cols
-        cell_h = (h - pad * 2 - header_h) / rows
-
-        # 画周标签
-        painter.setPen(QColor(_MUTED))
-        painter.setFont(QFont("", 11, QFont.Weight.Bold))
-        for c in range(cols):
-            cx = int(pad + cell_w * (c + 0.5))
-            painter.drawText(cx - 20, pad, 40, header_h - 4,
-                             Qt.AlignmentFlag.AlignCenter, self._WEEKDAYS[c])
-        # 画格子
-        font = QFont("", 11)
-        painter.setFont(font)
-        today_bj = time.strftime("%Y-%m-%d", time.gmtime((time.time() + 8 * 3600 * 1000) / 1000))
-        for (r, c, label, agg) in self._cells:
-            x = int(pad + cell_w * c) + 2
-            y = int(pad + header_h + cell_h * r) + 2
-            cw = int(cell_w) - 4
-            ch = int(cell_h) - 4
-            color = self._color_for(agg)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(color))
-            painter.drawRoundedRect(x, y, cw, ch, 8, 8)
-            # 日期数字
-            if label:
-                day_key = f"{self._year:04d}-{self._month:02d}-{int(label):02d}"
-                is_today = day_key == today_bj
-                if is_today:
-                    painter.setPen(QPen(QColor(_WARNING), 2))
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawRoundedRect(x + 1, y + 1, cw - 2, ch - 2, 8, 8)
-                    painter.setPen(QColor(_WARNING))
-                else:
-                    painter.setPen(QColor(_TEXT))
-                painter.drawText(x, y, cw, 18, Qt.AlignmentFlag.AlignCenter, label)
-                # 底部小数字：消耗或调用数
-                if agg is not None:
-                    painter.setPen(QColor(_TEXT, 200))
-                    painter.setFont(QFont("", 9))
-                    if self._mode == "cost":
-                        sub = f"¥{_fmt_money(agg.auto_cost)}"
-                    else:
-                        sub = f"{agg.calls}次"
-                    painter.drawText(x, y + ch - 18, cw, 14, Qt.AlignmentFlag.AlignCenter, sub)
-                    painter.setFont(font)
-        painter.end()
-
-    def mousePressEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-        w, h = self.width(), self.height()
-        pad = 8
-        header_h = 28
-        rows = 6
-        cols = 7
-        cell_w = (w - pad * 2) / cols
-        cell_h = (h - pad * 2 - header_h) / rows
-        px = event.position().x()
-        py = event.position().y()
-        if py < pad + header_h:
-            return
-        c = int((px - pad) // cell_w)
-        r = int((py - pad - header_h) // cell_h)
-        if 0 <= c < cols and 0 <= r < rows:
-            for (rr, cc, label, agg) in self._cells:
-                if rr == r and cc == c and label:
-                    key = f"{self._year:04d}-{self._month:02d}-{int(label):02d}"
-                    self.day_clicked.emit(key)
-                    break
-
-
-# ============================================================
-# 子页签 3：记录列表
-# ============================================================
-class _RecordsTab(QWidget):
-    def __init__(self, tracker: UsageTracker, parent=None):
-        super().__init__(parent)
-        self._tracker = tracker
-        self._setup_ui()
-        self.refresh()
-
-    def _setup_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
-
-        self._btns: list[tuple[QPushButton, Any]] = []  # (button, color_getter)
-
-        title_row = QHBoxLayout()
-        self._title = QLabel("缓存命中列表")
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        title_row.addWidget(self._title)
-        title_row.addStretch()
-
-        self._preset = QComboBox()
-        self._preset.addItems(["今天", "近 7 天", "近 30 天", "全部", "自定义"])
-        self._preset.setCurrentIndex(2)
-        self._preset.currentIndexChanged.connect(self._on_preset_change)
-        self._preset.setStyleSheet(
-            "QComboBox { padding: 4px 10px; background: rgba(224,226,242,0.05);"
-            f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; }}"
-        )
-        title_row.addWidget(self._preset)
-
-        today = QDate.currentDate()
-        self._start_edit = QDateEdit(today.addDays(-30))
-        self._end_edit = QDateEdit(today)
-        for d in (self._start_edit, self._end_edit):
-            d.setCalendarPopup(True)
-            d.setDisplayFormat("yyyy-MM-dd")
-            d.setEnabled(False)
-            d.setStyleSheet(
-                "QDateEdit { padding: 4px 8px; background: rgba(224,226,242,0.05);"
-                f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; }}"
+            total_tok = (
+                sel_summary.get("total_input_tokens", 0)
+                + sel_summary.get("total_cache_read_tokens", 0)
+                + sel_summary.get("total_output_tokens", 0)
             )
-            d.dateChanged.connect(self._on_date_change)
-        title_row.addWidget(self._start_edit)
-        title_row.addWidget(QLabel("~"))
-        title_row.addWidget(self._end_edit)
-        root.addLayout(title_row)
+            self._card_tokens.set_value(_fmt_int(total_tok))
+        except Exception as ex:
+            log.warning("刷新概览卡片失败: %s", ex)
 
-        # 操作按钮行
-        action_row = QHBoxLayout()
-        self._btn_refresh = self._mk_btn("🔄 刷新", _TRAE_BLUE)
-        self._btns.append((self._btn_refresh, lambda: _TRAE_BLUE))
-        self._btn_refresh.clicked.connect(self.refresh)
-        self._btn_export_json = self._mk_btn("📥 导出 JSON", _ACCENT)
-        self._btns.append((self._btn_export_json, lambda: _ACCENT))
-        self._btn_export_json.clicked.connect(self._export_json)
-        self._btn_export_csv = self._mk_btn("📊 导出 CSV", _ACCENT)
-        self._btns.append((self._btn_export_csv, lambda: _ACCENT))
-        self._btn_export_csv.clicked.connect(self._export_csv)
-        self._btn_import_json = self._mk_btn("📤 导入 JSON", _WARNING)
-        self._btns.append((self._btn_import_json, lambda: _WARNING))
-        self._btn_import_json.clicked.connect(self._import_json)
-        self._btn_import_csv = self._mk_btn("📤 导入 CSV", _WARNING)
-        self._btns.append((self._btn_import_csv, lambda: _WARNING))
-        self._btn_import_csv.clicked.connect(self._import_csv)
-        self._btn_open_dir = self._mk_btn("📂 数据目录", _MUTED)
-        self._btns.append((self._btn_open_dir, lambda: _MUTED))
-        self._btn_open_dir.clicked.connect(self._open_dir)
-        for b in (self._btn_refresh, self._btn_export_json, self._btn_export_csv,
-                  self._btn_import_json, self._btn_import_csv, self._btn_open_dir):
-            action_row.addWidget(b)
-        action_row.addStretch()
-        self._count_lbl = QLabel("")
-        self._count_lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
-        action_row.addWidget(self._count_lbl)
-        root.addLayout(action_row)
+    def _refresh_table(self) -> None:
+        s, e = self._preset_time_range(self._current_preset_idx)
+        try:
+            records = self._tracker.get_records(start_ms=s, end_ms=e)
+        except Exception as ex:
+            log.warning("获取用量记录失败: %s", ex)
+            records = []
+
+        # 限制表格显示条数（避免 UI 卡顿）
+        DISPLAY_LIMIT = 500
+        if len(records) > DISPLAY_LIMIT:
+            records = records[:DISPLAY_LIMIT]
+
+        self._table.setRowCount(len(records))
+        for row, rec in enumerate(records):
+            # 时间（北京时间）
+            bj_ms = rec.time + 8 * 3600 * 1000
+            bj_struct = time.gmtime(bj_ms / 1000)
+            time_str = time.strftime("%Y-%m-%d %H:%M", bj_struct)
+            self._table.setItem(row, 0, QTableWidgetItem(time_str))
+
+            # 模型名
+            model_name = (rec.model or "unknown")
+            model_item = QTableWidgetItem(model_name)
+            model_item.setToolTip(model_name)
+            self._table.setItem(row, 1, model_item)
+
+            # 层级（高峰/平峰）
+            from ...core.usage_tracker import _is_peak
+            tier = "高峰" if _is_peak(rec.time) else "平峰"
+            tier_item = QTableWidgetItem(tier)
+            tier_color = _WARNING if tier == "高峰" else _TRAE_BLUE
+            tier_item.setForeground(QColor(tier_color))
+            self._table.setItem(row, 2, tier_item)
+
+            # 输入（cache_hit + miss）
+            inp = rec.cache_read_tokens + rec.input_tokens
+            self._table.setItem(row, 3, QTableWidgetItem(_fmt_int(inp)))
+
+            # 输出
+            self._table.setItem(row, 4, QTableWidgetItem(_fmt_int(rec.output_tokens)))
+
+            # 费用（使用 cost_of 计算）
+            try:
+                cost = self._tracker.cost_of(rec)
+            except Exception:
+                cost = 0.0
+            cost_str = _fmt_money(cost)
+            cost_item = QTableWidgetItem(f"$ {cost_str}")
+            if cost > 0.5:
+                cost_item.setForeground(QColor(_WARNING))
+            if cost > 2.0:
+                cost_item.setForeground(QColor(_ERROR))
+            self._table.setItem(row, 5, cost_item)
+
+    # ---- 主题 ----
+
+    def apply_theme(self, theme=None) -> None:
+        """应用主题到本页所有控件。"""
+        if theme is not None:
+            _apply_theme_colors(theme)
+
+        # ComboBox
+        self._filter_combo.setStyleSheet(
+            f"QComboBox {{ padding: 4px 10px; background: {_SOFT_BG};"
+            f" border: 1px solid {_INPUT_BORDER}; border-radius: 6px; color: {_TEXT}; }}"
+            f"QComboBox QAbstractItemView {{ background: {_BG_SECONDARY}; color: {_TEXT};"
+            f" selection-background-color: {_ACCENT}; border: 1px solid {_INPUT_BORDER}; }}"
+        )
+
+        # 卡片
+        self._card_today.apply_theme(theme)
+        self._card_month.apply_theme(theme)
+        self._card_calls.apply_theme(theme)
+        self._card_tokens.apply_theme(theme)
 
         # 表格
-        self._table = QTableWidget(0, 9)
-        headers = ["时间(北京)", "模型", "用途", "输入", "缓存命中", "缓存写入", "输出", "推理", "消耗(¥)"]
-        self._table.setHorizontalHeaderLabels(headers)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSortingEnabled(True)
-        hh = self._table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        hh.setStretchLastSection(True)
-        self._table.setAlternatingRowColors(True)
         self._table.setStyleSheet(
-            "QTableWidget { background: rgba(30,33,42,0.5); border: 1px solid rgba(224,226,242,0.08);"
-            f"  border-radius: 8px; color: {_TEXT}; gridline-color: rgba(224,226,242,0.06); }}"
-            f"QHeaderView::section {{ background: rgba(224,226,242,0.04); color: {_MUTED}; padding: 6px;"
-            "  border: none; border-bottom: 1px solid rgba(224,226,242,0.1); }"
-            "QTableWidget::item { padding: 4px 8px; }"
+            f"QTableWidget {{ background: {_TAB_PANE_BG}; border: 1px solid {_PANEL_BORDER};"
+            f" border-radius: 8px; color: {_TEXT}; gridline-color: {_GRIDLINE}; }}"
+            f"QTableWidget::item {{ padding: 4px 8px; border: none; }}"
+            f"QTableWidget::item:selected {{ background: {_BG_HOVER}; color: {_TEXT}; }}"
         )
-        root.addWidget(self._table, stretch=1)
+        self._table.horizontalHeader().setStyleSheet(
+            f"QHeaderView::section {{ background: {_SOFT_BG}; color: {_MUTED};"
+            f" padding: 6px; border: none; border-bottom: 1px solid {_CELL_DIVIDER}; }}"
+        )
+        self._table.verticalHeader().setStyleSheet(
+            f"QHeaderView::section {{ background: transparent; color: {_DIM};"
+            f" border: none; border-right: 1px solid {_CELL_DIVIDER}; }}"
+        )
 
-    @staticmethod
-    def _mk_btn(text: str, color: str) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setStyleSheet(
-            f"QPushButton {{ padding: 5px 12px; background: rgba(224,226,242,0.05);"
-            f"  border: 1px solid rgba(224,226,242,0.12); border-radius: 6px; color: {color};"
-            f"  font-size: 12px; }}"
-            f"QPushButton:hover {{ background: rgba(224,226,242,0.12); }}"
-        )
-        return btn
 
-    def apply_theme(self, theme) -> None:
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        self._preset.setStyleSheet(
-            "QComboBox { padding: 4px 10px; background: rgba(224,226,242,0.05);"
-            f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; }}"
+# ===== _ModelsTab =====
+
+_MODEL_DISPLAY_NAMES = {
+    "deepseek-v4-flash": "DeepSeek-V4 Flash",
+    "deepseek-v4-pro": "DeepSeek-V4 Pro",
+}
+
+
+class _ModelsTab(QWidget):
+    """模型价格配置页：每个模型层级的峰谷定价 SpinBox + 保存。"""
+
+    def __init__(self, tracker: UsageTracker, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._tracker = tracker
+        self._price_spins: dict[str, dict[str, dict[str, QDoubleSpinBox]]] = {}
+        self._scroll_area: QScrollArea | None = None
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        # 外层：可滚动区域（内容自然铺开，不再固定高度压缩，彻底避免重叠）
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
         )
-        for d in (self._start_edit, self._end_edit):
-            d.setStyleSheet(
-                "QDateEdit { padding: 4px 8px; background: rgba(224,226,242,0.05);"
-                f"  border: 1px solid rgba(224,226,242,0.1); border-radius: 6px; color: {_TEXT}; }}"
+
+        content = QWidget()
+        content.setObjectName("ModelsPageContent")
+        content.setAutoFillBackground(False)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        title_lbl = QLabel("模型价格")
+        title_lbl.setObjectName("SettingsTitle")
+        title_lbl.setStyleSheet(
+            f"color: {_TEXT}; font-size: 18px; font-weight: 700;"
+        )
+        layout.addWidget(title_lbl)
+
+        hint_lbl = QLabel(
+            "单位：元 / 百万 Tokens（cacheHit / cacheMiss / output 分别计价）。\n"
+            "2026-08-17 起自动启用峰谷计价（高峰 9:00-12:00, 14:00-18:00 北京时间）。"
+        )
+        hint_lbl.setObjectName("ModelsHint")
+        hint_lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+        hint_lbl.setWordWrap(True)
+        layout.addWidget(hint_lbl)
+
+        current_pricing = self._safe_get_pricing()
+
+        for mk in PRICE_MODELS:
+            display_name = _MODEL_DISPLAY_NAMES.get(mk, mk)
+            grp = QGroupBox(display_name)
+            grp.setSizePolicy(
+                QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
             )
-        self._table.setStyleSheet(
-            "QTableWidget { background: rgba(30,33,42,0.5); border: 1px solid rgba(224,226,242,0.08);"
-            f"  border-radius: 8px; color: {_TEXT}; gridline-color: rgba(224,226,242,0.06); }}"
-            f"QHeaderView::section {{ background: rgba(224,226,242,0.04); color: {_MUTED}; padding: 6px;"
-            "  border: none; border-bottom: 1px solid rgba(224,226,242,0.1); }"
-            "QTableWidget::item { padding: 4px 8px; }"
+            grp_layout = QVBoxLayout(grp)
+            grp_layout.setSpacing(12)
+            grp_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+
+            self._price_spins[mk] = {}
+
+            for tier_name, tier_label in (("peak", "高峰时段"), ("offPeak", "平峰时段")):
+                tier_frame = QFrame()
+                # 内容自然高度（滚动区会纵向扩展），不再固定高度，避免行被压缩或溢出重叠
+                tier_frame.setSizePolicy(
+                    QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred
+                )
+                tier_outer = QVBoxLayout(tier_frame)
+                tier_outer.setSpacing(6)
+                tier_outer.setContentsMargins(8, 8, 8, 8)
+                # 强制布局不压缩子项，避免第 3 行 output 被挤掉
+                tier_outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+
+                # 时段标题（独立一行，不再放进 QFormLayout，避免干扰表单两列宽度计算）
+                tier_lbl = QLabel(tier_label)
+                tier_lbl.setStyleSheet(
+                    f"color: {_WARNING if tier_name == 'peak' else _TRAE_BLUE};"
+                    f" font-size: 13px; font-weight: 600;"
+                )
+                tier_outer.addWidget(tier_lbl)
+
+                # 真正的 3 行定价输入表单（只有 label + spin，不掺标题行）
+                form_wrap = QWidget()
+                form_wrap.setSizePolicy(
+                    QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+                )
+                form_layout = QFormLayout(form_wrap)
+                form_layout.setSpacing(10)
+                form_layout.setContentsMargins(0, 0, 0, 0)
+                form_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+                # 字段列可扩展；标签列固定右对齐，避免挤压 SpinBox
+                form_layout.setFieldGrowthPolicy(
+                    QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+                )
+                form_layout.setLabelAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+                form_layout.setFormAlignment(
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+                )
+
+                pv = (current_pricing.get("peakValley", {})
+                       .get(mk, {})
+                       .get(tier_name, {}))
+                self._price_spins[mk][tier_name] = {}
+
+                for k, k_label in (
+                    ("cacheHit", "缓存命中 (cacheHit)"),
+                    ("cacheMiss", "输入未命中 (cacheMiss)"),
+                    ("output", "输出 (output)"),
+                ):
+                    # 左侧标签：和 SpinBox 相同最小高度 + 垂直居中，保证左右对齐
+                    lbl = QLabel(f"{k_label}：")
+                    lbl.setObjectName("PriceFormLabel")   # 给 apply_theme 按名刷新主题色用
+                    lbl.setMinimumHeight(32)
+                    lbl.setSizePolicy(
+                        QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+                    )
+                    # 显式设置标签最小宽度，使三行输入框左缘严格对齐
+                    lbl.setMinimumWidth(180)
+                    lbl.setAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                    lbl.setStyleSheet(f"color: {_TEXT};")
+
+                    spin = QDoubleSpinBox()
+                    spin.setDecimals(4)
+                    spin.setRange(0.0, 1000.0)
+                    spin.setSingleStep(0.05)
+                    spin.setSuffix(" 元/MTok")
+                    spin.setValue(float(pv.get(k, 0.0)))
+                    # 保证 SpinBox 宽度够完整显示 "0.0000 元/MTok"（含 Windows 高 DPI 放大裕量）
+                    spin.setMinimumWidth(360)
+                    spin.setMinimumHeight(32)
+                    spin.setSizePolicy(
+                        QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+                    )
+
+                    form_layout.addRow(lbl, spin)
+                    self._price_spins[mk][tier_name][k] = spin
+
+                tier_outer.addWidget(form_wrap)
+                grp_layout.addWidget(tier_frame)
+
+            layout.addWidget(grp)
+
+        layout.addStretch()
+
+        # 按钮行
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self._reset_btn = QPushButton("恢复默认")
+        self._reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._reset_btn.clicked.connect(self._on_reset)
+        btn_row.addWidget(self._reset_btn)
+
+        self._save_btn = QPushButton("保存定价")
+        self._save_btn.setObjectName("Primary")
+        self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(self._save_btn)
+
+        btn_wrap = QWidget()
+        btn_wrap.setLayout(btn_row)
+        layout.addWidget(btn_wrap)
+
+        # 挂载滚动区
+        outer.addWidget(scroll)
+        scroll.setWidget(content)
+        self._scroll_area = scroll
+
+        self.apply_theme()
+        QTimer.singleShot(60, self._reload_from_tracker)
+
+    def _safe_get_pricing(self) -> dict:
+        try:
+            return self._tracker.pricing
+        except Exception:
+            return {}
+
+    def _reload_from_tracker(self) -> None:
+        current = self._safe_get_pricing()
+        for mk, tiers in self._price_spins.items():
+            for tier_name, keys in tiers.items():
+                pv = (current.get("peakValley", {})
+                       .get(mk, {})
+                       .get(tier_name, {}))
+                for k, spin in keys.items():
+                    try:
+                        spin.setValue(float(pv.get(k, spin.value())))
+                    except Exception:
+                        pass
+
+    def _on_reset(self) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("恢复默认")
+        box.setText("确定将所有定价恢复到默认值吗？")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )
-        self._count_lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
-        for btn, color_getter in self._btns:
-            color = color_getter()
-            btn.setStyleSheet(
-                f"QPushButton {{ padding: 5px 12px; background: rgba(224,226,242,0.05);"
-                f"  border: 1px solid rgba(224,226,242,0.12); border-radius: 6px; color: {color};"
-                f"  font-size: 12px; }}"
-                f"QPushButton:hover {{ background: rgba(224,226,242,0.12); }}"
-            )
-
-    def _on_preset_change(self, idx: int) -> None:
-        custom = idx == 4
-        self._start_edit.setEnabled(custom)
-        self._end_edit.setEnabled(custom)
-        self.refresh()
-
-    def _on_date_change(self) -> None:
-        if self._preset.currentIndex() == 4:
-            self.refresh()
-
-    def _get_range(self) -> tuple[int | None, int | None]:
-        idx = self._preset.currentIndex()
-        now_ms = int(time.time() * 1000)
-        day_ms = 24 * 3600 * 1000
-        if idx == 0:
-            bj_now = now_ms + 8 * 3600 * 1000
-            t = time.gmtime(bj_now / 1000)
-            start_bj = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
-            return int(start_bj * 1000) - 8 * 3600 * 1000, now_ms
-        if idx == 1:
-            return now_ms - 7 * day_ms, now_ms
-        if idx == 2:
-            return now_ms - 30 * day_ms, now_ms
-        if idx == 4:
-            sd = self._start_edit.date()
-            ed = self._end_edit.date()
-            start_bj = time.mktime((sd.year(), sd.month(), sd.day(), 0, 0, 0, 0, 0, -1))
-            end_bj = time.mktime((ed.year(), ed.month(), ed.day(), 23, 59, 59, 0, 0, -1))
-            return int(start_bj * 1000) - 8 * 3600 * 1000, int(end_bj * 1000) - 8 * 3600 * 1000
-        return None, None
-
-    def refresh(self) -> None:
-        s, e = self._get_range()
-        recs = self._tracker.get_records(start_ms=s, end_ms=e)
-        self._table.setSortingEnabled(False)
-        self._table.setRowCount(len(recs))
-        for i, r in enumerate(recs):
-            bj = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime((r.time + 8 * 3600 * 1000) / 1000))
-            row = [
-                bj, r.model or "-", r.purpose or "-",
-                _fmt_int(r.input_tokens), _fmt_int(r.cache_read_tokens),
-                _fmt_int(r.cache_write_tokens), _fmt_int(r.output_tokens),
-                _fmt_int(r.reasoning_tokens), _fmt_money(self._tracker.cost_of(r)),
-            ]
-            for c_idx, val in enumerate(row):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if c_idx == 8:
-                    item.setForeground(QColor(_ACCENT))
-                self._table.setItem(i, c_idx, item)
-        self._table.setSortingEnabled(True)
-        self._count_lbl.setText(f"共 {len(recs)} 条记录（总量 {self._tracker.total_records}）")
-
-    # ===== 导入导出 =====
-
-    def _export_json(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出 JSON",
-            str(self._tracker.data_dir / "json" / f"usage-{int(time.time())}.json"),
-            "JSON 文件 (*.json)",
+        by = box.button(QMessageBox.StandardButton.Yes)
+        if by:
+            by.setText("恢复")
+        bc = box.button(QMessageBox.StandardButton.Cancel)
+        if bc:
+            bc.setText("取消")
+        # 应用主题文本颜色，避免在浅色主题下背景变白但文字仍为浅色导致看不清
+        box.setStyleSheet(
+            f"QMessageBox {{ background: {_BG_SECONDARY}; }}"
+            f"QLabel {{ color: {_TEXT}; }}"
+            f"QPushButton {{ padding: 5px 14px; background: {_SOFT_BG};"
+            f" color: {_TEXT}; border: 1px solid {_BTN_BORDER}; border-radius: 6px; }}"
+            f"QPushButton:hover {{ background: {_HARD_BG}; }}"
         )
-        if not path:
+        if box.exec() != QMessageBox.StandardButton.Yes.value:
             return
         try:
-            n = self._tracker.export_json(path)
-            QMessageBox.information(self, "导出成功", f"已导出 {n} 条记录到：\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
+            self._tracker.reset_pricing()
+        except Exception as ex:
+            log.warning("reset_pricing 失败: %s", ex)
+        self._reload_from_tracker()
+        self._toast("已恢复默认定价", _ACCENT)
 
-    def _export_csv(self) -> None:
+    def _on_save(self) -> None:
+        try:
+            # 从当前 tracker 拿一份基准，保持 base  regime 不变
+            current = self._safe_get_pricing()
+            import copy
+            new_pricing = copy.deepcopy(current) if current else {}
+            if "base" not in new_pricing:
+                new_pricing["base"] = {}
+            if "peakValley" not in new_pricing:
+                new_pricing["peakValley"] = {}
+
+            for mk, tiers in self._price_spins.items():
+                if mk not in new_pricing["peakValley"]:
+                    new_pricing["peakValley"][mk] = {}
+                for tier_name, keys in tiers.items():
+                    if tier_name not in new_pricing["peakValley"][mk]:
+                        new_pricing["peakValley"][mk][tier_name] = {}
+                    for k, spin in keys.items():
+                        new_pricing["peakValley"][mk][tier_name][k] = float(spin.value())
+
+            ok = self._tracker.update_pricing(new_pricing)
+            if ok:
+                self._toast("定价已保存", _ACCENT)
+            else:
+                self._toast("保存失败：定价数据格式校验未通过", _ERROR)
+        except Exception as ex:
+            log.warning("保存定价失败: %s", ex)
+            self._toast(f"保存异常：{ex}", _ERROR)
+
+    def _toast(self, text: str, color: str) -> None:
+        try:
+            parent_win = self.window()
+            sb = getattr(parent_win, "status_bar", None)
+            if sb is not None and hasattr(sb, "show_temporary"):
+                sb.show_temporary(text, color=color, duration_ms=2200)
+                return
+        except Exception:
+            pass
+        log.info("[ModelsTab] %s", text)
+
+    def apply_theme(self, theme=None) -> None:
+        if theme is not None:
+            _apply_theme_colors(theme)
+
+        base_qss_btn = (
+            f"QPushButton {{ padding: 5px 12px; background: {_SOFT_BG};"
+            f" border: 1px solid {_BTN_BORDER}; border-radius: 6px; color: {_TEXT}; }}"
+            f"QPushButton:hover {{ background: {_HARD_BG}; }}"
+        )
+        self._reset_btn.setStyleSheet(base_qss_btn)
+        self._save_btn.setStyleSheet(
+            f"QPushButton {{ padding: 5px 16px; background: {_ACCENT};"
+            f" border: none; border-radius: 6px; color: {_BG_PRIMARY};"
+            f" font-weight: 600; }}"
+            f"QPushButton:hover {{ background: {_rgba_from_hex(_ACCENT, 0.85)}; }}"
+        )
+
+        grp_style = (
+            f"QGroupBox {{ color: {_TEXT}; font-size: 13px; font-weight: 600;"
+            f" border: 1px solid {_PANEL_BORDER}; border-radius: 10px;"
+            f" margin-top: 10px; padding-top: 8px; background: {_TAB_PANE_BG}; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; }}"
+        )
+        for mk in PRICE_MODELS:
+            parent_grp = self.findChild(QGroupBox, name="")
+            # 直接遍历 group box 子控件
+        for c in self.findChildren(QGroupBox):
+            c.setStyleSheet(grp_style)
+
+        # 标题与提示随主题刷新
+        for lbl in self.findChildren(QLabel, "SettingsTitle"):
+            lbl.setStyleSheet(
+                f"color: {_TEXT}; font-size: 18px; font-weight: 700;"
+            )
+        for lbl in self.findChildren(QLabel, "ModelsHint"):
+            lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+
+        # 表单左侧标签主题色刷新（切主题时保持与 SpinBox 同一行视觉匹配）
+        for lbl in self.findChildren(QLabel, "PriceFormLabel"):
+            lbl.setStyleSheet(f"color: {_TEXT};")
+
+        for spin in self.findChildren(QDoubleSpinBox):
+            spin.setStyleSheet(
+                f"QDoubleSpinBox {{ padding: 2px 34px 2px 8px; background: {_SOFT_BG};"
+                f" color: {_TEXT}; border: 1px solid {_INPUT_BORDER};"
+                f" border-radius: 6px; min-height: 28px; }}"
+                f"QDoubleSpinBox::up-button {{ subcontrol-position: top right;"
+                f" width: 22px; height: 14px; border: none;"
+                f" background: {_HARD_BG}; border-top-right-radius: 4px;"
+                f" margin: 2px 2px 0 0; }}"
+                f"QDoubleSpinBox::down-button {{ subcontrol-position: bottom right;"
+                f" width: 22px; height: 14px; border: none;"
+                f" background: {_HARD_BG}; border-bottom-right-radius: 4px;"
+                f" margin: 0 2px 2px 0; }}"
+                f"QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{"
+                f" background: {_rgba_from_hex(_ACCENT, 0.22)}; }}"
+                f"QDoubleSpinBox::up-arrow {{ width: 6px; height: 6px;"
+                f" border-left: 3px solid transparent; border-right: 3px solid transparent;"
+                f" border-bottom: 4px solid {_TEXT}; image: none; }}"
+                f"QDoubleSpinBox::down-arrow {{ width: 6px; height: 6px;"
+                f" border-left: 3px solid transparent; border-right: 3px solid transparent;"
+                f" border-top: 4px solid {_TEXT}; image: none; }}"
+            )
+
+
+# ===== _BillingTab =====
+
+class _BillingTab(QWidget):
+    """计费设置页：日期范围 + 按层级汇总 + CSV 导出。"""
+
+    def __init__(self, tracker: UsageTracker, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._tracker = tracker
+        self._summary_labels: dict[str, QLabel] = {}
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        title_lbl = QLabel("计费设置")
+        title_lbl.setStyleSheet(
+            f"color: {_TEXT}; font-size: 18px; font-weight: 700;"
+        )
+        layout.addWidget(title_lbl)
+
+        # 日期范围行
+        date_row = QHBoxLayout()
+        date_row.setSpacing(12)
+
+        range_lbl = QLabel("计费周期：")
+        range_lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+        date_row.addWidget(range_lbl)
+
+        today = QDate.currentDate()
+        self._start_date = QDateEdit()
+        self._start_date.setCalendarPopup(True)
+        self._start_date.setDisplayFormat("yyyy-MM-dd")
+        self._start_date.setDate(today.addDays(-29))
+        date_row.addWidget(self._start_date)
+
+        sep_lbl = QLabel("→")
+        sep_lbl.setStyleSheet(f"color: {_MUTED};")
+        date_row.addWidget(sep_lbl)
+
+        self._end_date = QDateEdit()
+        self._end_date.setCalendarPopup(True)
+        self._end_date.setDisplayFormat("yyyy-MM-dd")
+        self._end_date.setDate(today)
+        date_row.addWidget(self._end_date)
+
+        self._calc_btn = QPushButton("统计")
+        self._calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._calc_btn.clicked.connect(self._on_calc)
+        date_row.addWidget(self._calc_btn)
+
+        date_row.addStretch()
+        date_wrap = QWidget()
+        date_wrap.setLayout(date_row)
+        layout.addWidget(date_wrap)
+
+        # 层级汇总
+        summary_grp = QGroupBox("层级消耗汇总")
+        summary_layout = QFormLayout(summary_grp)
+        summary_layout.setSpacing(8)
+        for tier_key, tier_name in (
+            ("flash", "Flash 层级 (V4-Flash)"),
+            ("pro", "Pro 层级 (V4-Pro)"),
+            ("unknown", "其他模型"),
+            ("total", "合计"),
+        ):
+            lbl_title = QLabel(tier_name)
+            lbl_title.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+            val = QLabel("¥ 0.00  ·  0 次调用 ·  0 Tokens")
+            val.setStyleSheet(
+                f"color: {_TEXT}; font-size: 13px; font-family: Consolas, monospace;"
+            )
+            self._summary_labels[tier_key] = val
+            summary_layout.addRow(lbl_title, val)
+        layout.addWidget(summary_grp)
+
+        # 导出区
+        export_grp = QGroupBox("数据导出")
+        export_layout = QVBoxLayout(export_grp)
+        export_layout.setSpacing(8)
+
+        export_hint = QLabel(
+            "支持导出全部用量记录为 CSV / JSON，方便二次分析与对账。"
+        )
+        export_hint.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+        export_hint.setWordWrap(True)
+        export_layout.addWidget(export_hint)
+
+        export_row = QHBoxLayout()
+        export_row.addStretch()
+        self._export_csv_btn = QPushButton("导出 CSV")
+        self._export_csv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._export_csv_btn.clicked.connect(self._on_export_csv)
+        export_row.addWidget(self._export_csv_btn)
+
+        self._export_json_btn = QPushButton("导出 JSON")
+        self._export_json_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._export_json_btn.clicked.connect(self._on_export_json)
+        export_row.addWidget(self._export_json_btn)
+        export_wrap = QWidget()
+        export_wrap.setLayout(export_row)
+        export_layout.addWidget(export_wrap)
+
+        try:
+            ddir = str(self._tracker.data_dir) if hasattr(self._tracker, "data_dir") else ""
+            path_lbl = QLabel(f"导出默认目录：{ddir}")
+            path_lbl.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
+            path_lbl.setWordWrap(True)
+            export_layout.addWidget(path_lbl)
+        except Exception:
+            pass
+
+        layout.addWidget(export_grp)
+
+        layout.addStretch()
+        self.apply_theme()
+        QTimer.singleShot(70, self._on_calc)
+
+    def _qdate_to_utc_ms(self, qd: QDate, end_of_day: bool = False) -> int:
+        """QDate（按北京时间理解）转 UTC 毫秒。"""
+        y, m, d = qd.year(), qd.month(), qd.day()
+        hhmmss = "23:59:59" if end_of_day else "00:00:00"
+        bj_struct = time.strptime(f"{y}-{m:02d}-{d:02d} {hhmmss}", "%Y-%m-%d %H:%M:%S")
+        return int(time.mktime(bj_struct)) * 1000 - 8 * 3600 * 1000
+
+    def _on_calc(self) -> None:
+        try:
+            start_ms = self._qdate_to_utc_ms(self._start_date.date(), False)
+            end_ms = self._qdate_to_utc_ms(self._end_date.date(), True)
+            records = self._tracker.get_records(start_ms=start_ms, end_ms=end_ms)
+        except Exception as ex:
+            log.warning("计费统计失败: %s", ex)
+            records = []
+
+        from ...core.usage_tracker import _model_key
+        agg = {
+            "flash": {"cost": 0.0, "calls": 0, "tokens": 0},
+            "pro": {"cost": 0.0, "calls": 0, "tokens": 0},
+            "unknown": {"cost": 0.0, "calls": 0, "tokens": 0},
+            "total": {"cost": 0.0, "calls": 0, "tokens": 0},
+        }
+        for rec in records:
+            mk = _model_key(rec.model)
+            if mk == "deepseek-v4-flash":
+                bucket = "flash"
+            elif mk == "deepseek-v4-pro":
+                bucket = "pro"
+            else:
+                bucket = "unknown"
+            try:
+                c = self._tracker.cost_of(rec)
+            except Exception:
+                c = 0.0
+            toks = (
+                rec.input_tokens + rec.cache_read_tokens
+                + rec.cache_write_tokens + rec.output_tokens
+                + rec.reasoning_tokens
+            )
+            agg[bucket]["cost"] += c
+            agg[bucket]["calls"] += 1
+            agg[bucket]["tokens"] += toks
+            agg["total"]["cost"] += c
+            agg["total"]["calls"] += 1
+            agg["total"]["tokens"] += toks
+
+        for k, v in agg.items():
+            lbl = self._summary_labels.get(k)
+            if lbl is None:
+                continue
+            text = (
+                f"¥ {_fmt_money(v['cost'])}  ·  "
+                f"{_fmt_int(v['calls'])} 次调用  ·  "
+                f"{_fmt_int(v['tokens'])} Tokens"
+            )
+            lbl.setText(text)
+
+    def _export_dir_default(self) -> str:
+        try:
+            return str(self._tracker.data_dir)
+        except Exception:
+            return str(Path.home())
+
+    def _on_export_csv(self) -> None:
+        default_dir = self._export_dir_default()
+        default_name = time.strftime("usage-records-%Y%m%d-%H%M%S.csv", time.localtime())
         path, _ = QFileDialog.getSaveFileName(
             self, "导出 CSV",
-            str(self._tracker.data_dir / "csv" / f"usage-{int(time.time())}.csv"),
+            str(Path(default_dir) / default_name),
             "CSV 文件 (*.csv)",
         )
         if not path:
             return
         try:
             n = self._tracker.export_csv(path)
-            QMessageBox.information(self, "导出成功", f"已导出 {n} 条记录到：\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
+            self._toast(f"已导出 {n} 条记录 → CSV", _ACCENT)
+        except Exception as ex:
+            log.warning("CSV 导出失败: %s", ex)
+            self._toast(f"导出失败：{ex}", _ERROR)
 
-    def _import_json(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "导入 JSON", "", "JSON 文件 (*.json)")
+    def _on_export_json(self) -> None:
+        default_dir = self._export_dir_default()
+        default_name = time.strftime("usage-records-%Y%m%d-%H%M%S.json", time.localtime())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 JSON",
+            str(Path(default_dir) / default_name),
+            "JSON 文件 (*.json)",
+        )
         if not path:
             return
         try:
-            added, skipped = self._tracker.import_json(path)
-            QMessageBox.information(self, "导入完成", f"新增 {added} 条，跳过（重复/无效）{skipped} 条")
-            self.refresh()
-        except Exception as e:
-            QMessageBox.critical(self, "导入失败", str(e))
+            n = self._tracker.export_json(path)
+            self._toast(f"已导出 {n} 条记录 → JSON", _ACCENT)
+        except Exception as ex:
+            log.warning("JSON 导出失败: %s", ex)
+            self._toast(f"导出失败：{ex}", _ERROR)
 
-    def _import_csv(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "导入 CSV", "", "CSV 文件 (*.csv)")
-        if not path:
-            return
+    def _toast(self, text: str, color: str) -> None:
         try:
-            added, skipped = self._tracker.import_csv(path)
-            QMessageBox.information(self, "导入完成", f"新增 {added} 条，跳过（重复/无效）{skipped} 条")
-            self.refresh()
-        except Exception as e:
-            QMessageBox.critical(self, "导入失败", str(e))
+            parent_win = self.window()
+            sb = getattr(parent_win, "status_bar", None)
+            if sb is not None and hasattr(sb, "show_temporary"):
+                sb.show_temporary(text, color=color, duration_ms=2500)
+                return
+        except Exception:
+            pass
+        log.info("[BillingTab] %s", text)
 
-    def _open_dir(self) -> None:
-        import os, sys, subprocess
-        p = str(self._tracker.data_dir)
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(p)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", p])
-            else:
-                subprocess.Popen(["xdg-open", p])
-        except Exception as e:
-            QMessageBox.warning(self, "无法打开", f"目录路径：{p}\n\n{e}")
+    def apply_theme(self, theme=None) -> None:
+        if theme is not None:
+            _apply_theme_colors(theme)
+
+        for de in (self._start_date, self._end_date):
+            de.setStyleSheet(
+                f"QDateEdit {{ padding: 4px 8px; background: {_SOFT_BG}; color: {_TEXT};"
+                f" border: 1px solid {_INPUT_BORDER}; border-radius: 6px; }}"
+            )
+
+        btn_style = (
+            f"QPushButton {{ padding: 5px 12px; background: {_SOFT_BG};"
+            f" border: 1px solid {_BTN_BORDER}; border-radius: 6px; color: {_TEXT}; }}"
+            f"QPushButton:hover {{ background: {_HARD_BG}; }}"
+        )
+        self._calc_btn.setStyleSheet(btn_style)
+        self._export_csv_btn.setStyleSheet(btn_style)
+        self._export_json_btn.setStyleSheet(btn_style)
+
+        grp_style = (
+            f"QGroupBox {{ color: {_TEXT}; font-size: 13px; font-weight: 600;"
+            f" border: 1px solid {_PANEL_BORDER}; border-radius: 10px;"
+            f" margin-top: 10px; padding-top: 8px; background: {_TAB_PANE_BG}; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; }}"
+        )
+        for c in self.findChildren(QGroupBox):
+            c.setStyleSheet(grp_style)
 
 
-# ============================================================
-# 子页签 4：价格表
-# ============================================================
-class _PricingTab(QWidget):
-    pricing_changed = Signal()
+# ===== _SettingsTab =====
 
-    def __init__(self, tracker: UsageTracker, parent=None):
+class _ApiKeyDialog(QDialog):
+    """临时记忆 API Key 对话框（保存到 ~/.dsh/.credentials.yaml）。"""
+
+    def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._tracker = tracker
+        self.setWindowTitle("设置 API Key（临时记忆）")
+        self.resize(520, 240)
+        self._result_key: str = ""
         self._setup_ui()
-        self._load_current()
 
     def _setup_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
 
-        self._spins: list[QDoubleSpinBox] = []
-        self._btns: list[tuple[QPushButton, Any]] = []  # (button, color_getter)
-
-        self._title = QLabel("价格表")
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        root.addWidget(self._title)
-
-        self._info = QLabel(
-            "· <b>基础价</b>（base）：2026-08-17 之前的老价格表，兼容旧记录。<br>"
-            "· <b>峰谷价</b>（peakValley）：2026-08-17 00:00 起生效。<br>"
-            "· 高峰时段（北京）：9:00–12:00、14:00–18:00；其余为空闲时段。<br>"
-            "· 自动计价（auto）：按调用时间自动切换基础价 / 峰谷价。"
+        desc = QLabel(
+            "将 DeepSeek API Key 写入本地凭据文件，DSH 服务会自动热加载。\n"
+            "仅保存在本机 ~/.dsh/.credentials.yaml，不会上传任何第三方服务器。"
         )
-        self._info.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
-        self._info.setTextFormat(Qt.TextFormat.RichText)
-        self._info.setWordWrap(True)
-        root.addWidget(self._info)
+        desc.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
 
-        # 生效时间标注
-        self._effect_lbl = QLabel(f"新价格表生效时间（北京）：2026-08-17 00:00")
-        self._effect_lbl.setStyleSheet(f"color: {_WARNING}; font-size: 12px; font-weight: 600;")
-        root.addWidget(self._effect_lbl)
+        form = QFormLayout()
+        form.setSpacing(10)
 
-        # 分组：基础价 / 峰谷价
-        self._tabs = QTabWidget()
-        self._tabs.setStyleSheet(
-            "QTabWidget::pane { background: rgba(30,33,42,0.5); border: 1px solid rgba(224,226,242,0.08); border-radius: 10px; }"
-            f"QTabBar::tab {{ padding: 6px 16px; background: rgba(224,226,242,0.03); color: {_MUTED};"
-            "  border: 1px solid rgba(224,226,242,0.06); border-bottom: none; margin-right: 4px;"
-            "  border-top-left-radius: 8px; border-top-right-radius: 8px; }"
-            f"QTabBar::tab:selected {{ background: rgba(50,240,140,0.08); color: {_ACCENT}; }}"
+        self._key_edit = QLineEdit()
+        self._key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key_edit.setPlaceholderText("sk-xxxxxxxxxxxxxxxxxxxxxxxx")
+        self._key_edit.setStyleSheet(
+            f"QLineEdit {{ padding: 8px 12px; background: {_SOFT_BG};"
+            f" border: 1px solid {_CODE_INPUT_BORDER}; border-radius: 8px;"
+            f" color: {_TEXT}; font-family: 'Consolas', monospace; }}"
         )
+        form.addRow("API Key：", self._key_edit)
 
-        self._base_tab = self._build_base_tab()
-        self._tabs.addTab(self._base_tab, "基础价 (base)")
+        self._show_cb = QCheckBox("显示明文")
+        self._show_cb.toggled.connect(self._toggle_visible)
+        form.addRow(self._show_cb)
 
-        self._peak_tab = self._build_peak_tab()
-        self._tabs.addTab(self._peak_tab, "峰谷价 (peakValley)")
-        root.addWidget(self._tabs, stretch=1)
+        layout.addLayout(form)
 
-        # 底部按钮
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self._btn_reset = _RecordsTab._mk_btn("↺ 恢复默认", _ERROR)
-        self._btns.append((self._btn_reset, lambda: _ERROR))
-        self._btn_reset.clicked.connect(self._reset)
-        self._btn_save = _RecordsTab._mk_btn("💾 保存价格表", _ACCENT)
-        self._btn_save.setStyleSheet(
-            "QPushButton { padding: 6px 18px; background: rgba(50,240,140,0.15);"
-            f"  border: 1px solid rgba(50,240,140,0.35); border-radius: 8px; color: {_ACCENT};"
-            "  font-size: 13px; font-weight: 600; }"
-            "QPushButton:hover { background: rgba(50,240,140,0.25); }"
-        )
-        self._btn_save.clicked.connect(self._save)
-        btn_row.addWidget(self._btn_reset)
-        btn_row.addWidget(self._btn_save)
-        root.addLayout(btn_row)
+        hint = QLabel("获取地址：https://platform.deepseek.com/")
+        hint.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
+        layout.addWidget(hint)
 
-    def _spin(self, value: float) -> QDoubleSpinBox:
-        sp = QDoubleSpinBox()
-        sp.setRange(0.0, 9999.99)
-        sp.setDecimals(4)
-        sp.setSingleStep(0.01)
-        sp.setValue(value)
-        sp.setStyleSheet(
-            "QDoubleSpinBox { padding: 4px 6px; background: rgba(224,226,242,0.05);"
-            f"  border: 1px solid rgba(224,226,242,0.12); border-radius: 6px; color: {_TEXT}; }}"
-        )
-        self._spins.append(sp)
-        return sp
-
-    def _build_base_tab(self) -> QWidget:
-        w = QWidget()
-        grid = QGridLayout(w)
-        grid.setContentsMargins(16, 16, 16, 16)
-        grid.setSpacing(12)
-        headers = ["模型", "缓存命中 (元/百万 token)", "输入未命中 (元/百万 token)", "输出 (元/百万 token)"]
-        for c, h in enumerate(headers):
-            lbl = QLabel(h)
-            lbl.setStyleSheet("color: #9599A6; font-size: 12px; font-weight: 600;")
-            grid.addWidget(lbl, 0, c)
-        self._base_spins: dict[str, dict[str, QDoubleSpinBox]] = {}
-        for r, mk in enumerate(PRICE_MODELS, start=1):
-            name_map = {"deepseek-v4-flash": "deepseek-v4-flash", "deepseek-v4-pro": "deepseek-v4-pro"}
-            lbl = QLabel(name_map[mk])
-            lbl.setStyleSheet("color: #E0E2F2; font-weight: 600;")
-            grid.addWidget(lbl, r, 0)
-            self._base_spins[mk] = {}
-            for c, k in enumerate(["cacheHit", "cacheMiss", "output"], start=1):
-                sp = self._spin(0)
-                self._base_spins[mk][k] = sp
-                grid.addWidget(sp, r, c)
-        return w
-
-    def _build_peak_tab(self) -> QWidget:
-        w = QScrollArea()
-        w.setWidgetResizable(True)
-        inner = QFrame()
-        inner.setStyleSheet("QFrame { background: transparent; }")
-        layout = QVBoxLayout(inner)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(16)
-        self._peak_spins: dict[str, dict[str, dict[str, QDoubleSpinBox]]] = {}
-        for tier_name, tier_key in [("🌞 高峰时段 (peak)", "peak"), ("🌙 空闲时段 (offPeak)", "offPeak")]:
-            section = QLabel(tier_name)
-            section.setStyleSheet("color: #E0E2F2; font-size: 14px; font-weight: 700; margin-top: 4px;")
-            layout.addWidget(section)
-            grid = QGridLayout()
-            grid.setSpacing(12)
-            headers = ["模型", "缓存命中 (元/百万)", "输入未命中 (元/百万)", "输出 (元/百万)"]
-            for c, h in enumerate(headers):
-                lbl = QLabel(h)
-                lbl.setStyleSheet("color: #9599A6; font-size: 12px; font-weight: 600;")
-                grid.addWidget(lbl, 0, c)
-            self._peak_spins[tier_key] = {}
-            for r, mk in enumerate(PRICE_MODELS, start=1):
-                lbl = QLabel(mk)
-                lbl.setStyleSheet("color: #E0E2F2; font-weight: 600;")
-                grid.addWidget(lbl, r, 0)
-                self._peak_spins[tier_key][mk] = {}
-                for c, k in enumerate(["cacheHit", "cacheMiss", "output"], start=1):
-                    sp = self._spin(0)
-                    self._peak_spins[tier_key][mk][k] = sp
-                    grid.addWidget(sp, r, c)
-            layout.addLayout(grid)
         layout.addStretch()
-        w.setWidget(inner)
-        return w
 
-    def _load_current(self) -> None:
-        pricing = self._tracker.pricing
-        for mk in PRICE_MODELS:
-            for k in ("cacheHit", "cacheMiss", "output"):
-                self._base_spins[mk][k].setValue(float(pricing["base"][mk][k]))
-        for tier in ("peak", "offPeak"):
-            for mk in PRICE_MODELS:
-                for k in ("cacheHit", "cacheMiss", "output"):
-                    self._peak_spins[tier][mk][k].setValue(float(pricing["peakValley"][mk][tier][k]))
-
-    def apply_theme(self, theme) -> None:
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        self._info.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
-        self._effect_lbl.setStyleSheet(f"color: {_WARNING}; font-size: 12px; font-weight: 600;")
-        self._tabs.setStyleSheet(
-            "QTabWidget::pane { background: rgba(30,33,42,0.5); border: 1px solid rgba(224,226,242,0.08); border-radius: 10px; }"
-            f"QTabBar::tab {{ padding: 6px 16px; background: rgba(224,226,242,0.03); color: {_MUTED};"
-            "  border: 1px solid rgba(224,226,242,0.06); border-bottom: none; margin-right: 4px;"
-            "  border-top-left-radius: 8px; border-top-right-radius: 8px; }"
-            f"QTabBar::tab:selected {{ background: rgba(50,240,140,0.08); color: {_ACCENT}; }}"
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
-        for sp in self._spins:
-            sp.setStyleSheet(
-                "QDoubleSpinBox { padding: 4px 6px; background: rgba(224,226,242,0.05);"
-                f"  border: 1px solid rgba(224,226,242,0.12); border-radius: 6px; color: {_TEXT}; }}"
-            )
-        for btn, color_getter in self._btns:
-            color = color_getter()
-            btn.setStyleSheet(
-                f"QPushButton {{ padding: 5px 12px; background: rgba(224,226,242,0.05);"
-                f"  border: 1px solid rgba(224,226,242,0.12); border-radius: 6px; color: {color};"
-                f"  font-size: 12px; }}"
-                f"QPushButton:hover {{ background: rgba(224,226,242,0.12); }}"
-            )
-        self._btn_save.setStyleSheet(
-            "QPushButton { padding: 6px 18px; background: rgba(50,240,140,0.15);"
-            f"  border: 1px solid rgba(50,240,140,0.35); border-radius: 8px; color: {_ACCENT};"
-            "  font-size: 13px; font-weight: 600; }"
-            "QPushButton:hover { background: rgba(50,240,140,0.25); }"
+        sb = btns.button(QDialogButtonBox.StandardButton.Save)
+        if sb:
+            sb.setText("保存")
+        cb_btn = btns.button(QDialogButtonBox.StandardButton.Cancel)
+        if cb_btn:
+            cb_btn.setText("取消")
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self._apply_theme_style()
+
+    def _toggle_visible(self, checked: bool) -> None:
+        mode = QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        self._key_edit.setEchoMode(mode)
+
+    def _apply_theme_style(self) -> None:
+        base_btn = (
+            f"QPushButton {{ padding: 5px 14px; background: {_SOFT_BG};"
+            f" border: 1px solid {_BTN_BORDER}; border-radius: 6px; color: {_TEXT}; }}"
+            f"QPushButton:hover {{ background: {_HARD_BG}; }}"
         )
+        self.setStyleSheet(base_btn)
+        try:
+            cb = self.findChild(QDialogButtonBox)
+            if cb:
+                save_btn = cb.button(QDialogButtonBox.StandardButton.Save)
+                if save_btn:
+                    save_btn.setStyleSheet(
+                        f"QPushButton {{ padding: 5px 16px; background: {_ACCENT};"
+                        f" border: none; border-radius: 6px; color: {_BG_PRIMARY};"
+                        f" font-weight: 600; }}"
+                    )
+        except Exception:
+            pass
 
-    def _collect(self) -> dict:
-        import copy
-        new_pricing = copy.deepcopy(self._tracker.pricing)
-        for mk in PRICE_MODELS:
-            for k in ("cacheHit", "cacheMiss", "output"):
-                new_pricing["base"][mk][k] = float(self._base_spins[mk][k].value())
-        for tier in ("peak", "offPeak"):
-            for mk in PRICE_MODELS:
-                for k in ("cacheHit", "cacheMiss", "output"):
-                    new_pricing["peakValley"][mk][tier][k] = float(self._peak_spins[tier][mk][k].value())
-        return new_pricing
+    def _on_accept(self) -> None:
+        self._result_key = self._key_edit.text().strip()
+        self.accept()
 
-    def _save(self) -> None:
-        new_pricing = self._collect()
-        if self._tracker.update_pricing(new_pricing):
-            self.pricing_changed.emit()
-            QMessageBox.information(self, "保存成功", "价格表已更新并持久化。")
-        else:
-            QMessageBox.warning(self, "保存失败", "数据校验未通过，请检查数值。")
+    def get_key(self) -> str:
+        return self._result_key
 
-    def _reset(self) -> None:
-        if QMessageBox.question(
-            self, "确认恢复",
-            "将覆盖当前价格表为官方默认值，是否继续？",
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        self._tracker.reset_pricing()
-        self._load_current()
-        self.pricing_changed.emit()
+    def set_initial_key(self, key: str) -> None:
+        self._key_edit.setText(key or "")
 
 
-# ============================================================
-# 子页签 5：余额查询（沿用 DSH Work BalanceClient 双通道）
-# ============================================================
-class _BalanceTab(QWidget):
-    def __init__(self, balance_client: BalanceClient, parent=None):
-        super().__init__(parent)
-        self._bc = balance_client
-        self._temp_key_dialog_open = False
-        self._setup_ui()
-        # 如果已有缓存则显示
-        cached = self._bc.cached
-        if cached:
-            self._apply_result(cached)
+class _SettingsTab(QWidget):
+    """设置页：API Key 临时记忆 + 主题 + DSH 路径 + 保存。"""
 
-    def _setup_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
-
-        self._btns: list[tuple[QPushButton, Any]] = []  # (button, color_getter)
-
-        self._title = QLabel("剩余余额查询")
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        root.addWidget(self._title)
-
-        self._info = QLabel(
-            "💡 DSH Work 使用 <b>双通道容错</b>查询余额：<br>"
-            "&nbsp;&nbsp;① 首选：<b>DSH 代理</b>（credentials.getBalance RPC，DSH 内部持有 Key，客户端只拿脱敏数字）<br>"
-            "&nbsp;&nbsp;② 降级：<b>平台直连</b>（api.deepseek.com/user/balance，临时 Key 仅本次会话内存中存活，<b>不落盘</b>）<br>"
-            "状态栏会明确标注余额来源。"
-        )
-        self._info.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
-        self._info.setTextFormat(Qt.TextFormat.RichText)
-        self._info.setWordWrap(True)
-        root.addWidget(self._info)
-
-        # 大卡片显示余额
-        self._card = QFrame()
-        self._card.setObjectName("UsageCard")
-        self._card.setStyleSheet(
-            "QFrame#UsageCard {"
-            "  background: rgba(50, 240, 140, 0.05);"
-            "  border: 1px solid rgba(50, 240, 140, 0.20);"
-            "  border-radius: 16px;"
-            "}"
-        )
-        self._card.setMinimumHeight(160)
-        cl = QVBoxLayout(self._card)
-        cl.setContentsMargins(32, 24, 32, 24)
-        cl.setSpacing(8)
-        label = QLabel("当前账户余额")
-        label.setStyleSheet(f"color: {_MUTED}; font-size: 13px;")
-        cl.addWidget(label)
-        self._value_lbl = QLabel("--")
-        self._value_lbl.setStyleSheet(f"color: {_ACCENT}; font-size: 42px; font-weight: 800;")
-        cl.addWidget(self._value_lbl)
-        self._source_lbl = QLabel("尚未查询")
-        self._source_lbl.setStyleSheet(f"color: {_DIM}; font-size: 12px;")
-        cl.addWidget(self._source_lbl)
-        self._time_lbl = QLabel("")
-        self._time_lbl.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
-        cl.addWidget(self._time_lbl)
-        cl.addStretch()
-        root.addWidget(self._card)
-
-        # 按钮行
-        btn_row = QHBoxLayout()
-        self._btn_query = _RecordsTab._mk_btn("🔍 查询余额", _ACCENT)
-        self._btn_query.setStyleSheet(
-            "QPushButton { padding: 8px 20px; background: rgba(50,240,140,0.15);"
-            f"  border: 1px solid rgba(50,240,140,0.35); border-radius: 8px; color: {_ACCENT};"
-            "  font-size: 13px; font-weight: 600; }"
-            "QPushButton:hover { background: rgba(50,240,140,0.25); }"
-        )
-        self._btn_query.clicked.connect(self._query)
-        self._btn_force = _RecordsTab._mk_btn("🔄 强制刷新（忽略缓存）", _TRAE_BLUE)
-        self._btns.append((self._btn_force, lambda: _TRAE_BLUE))
-        self._btn_force.clicked.connect(lambda: self._query(force=True))
-        self._btn_set_key = _RecordsTab._mk_btn("🔑 设置降级 Key（仅内存）", _WARNING)
-        self._btns.append((self._btn_set_key, lambda: _WARNING))
-        self._btn_set_key.clicked.connect(self._set_temp_key)
-        self._btn_clear_key = _RecordsTab._mk_btn("🗑 清除临时 Key", _ERROR)
-        self._btns.append((self._btn_clear_key, lambda: _ERROR))
-        self._btn_clear_key.clicked.connect(self._clear_temp_key)
-        for b in (self._btn_query, self._btn_force, self._btn_set_key, self._btn_clear_key):
-            btn_row.addWidget(b)
-        btn_row.addStretch()
-        root.addLayout(btn_row)
-
-        # 最近一次错误提示
-        self._err_lbl = QLabel("")
-        self._err_lbl.setStyleSheet(f"color: {_ERROR}; font-size: 12px; padding: 8px 4px;")
-        self._err_lbl.setWordWrap(True)
-        root.addWidget(self._err_lbl)
-
-        root.addStretch()
-
-    def _apply_result(self, r: BalanceResult) -> None:
-        if not r.is_available:
-            self._value_lbl.setText("不可用")
-            self._value_lbl.setStyleSheet(f"color: {_ERROR}; font-size: 42px; font-weight: 800;")
-            self._source_lbl.setText("查询失败")
-            self._err_lbl.setText(f"错误：{r.error or '未知原因'}\n"
-                                  "提示：首选 DSH 代理不可用？尝试设置降级临时 Key（🔑 按钮）。")
-        else:
-            self._value_lbl.setText(f"¥ {r.balance:.2f}")
-            self._value_lbl.setStyleSheet(f"color: {_ACCENT}; font-size: 42px; font-weight: 800;")
-            self._source_lbl.setText(f"来源：{r.source_label}　·　币种：{r.currency}")
-            self._err_lbl.setText("")
-        if r.queried_at:
-            bj = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r.queried_at))
-            self._time_lbl.setText(f"查询时间（本地）：{bj}")
-
-    def apply_theme(self, theme) -> None:
-        self._title.setStyleSheet(f"color: {_TEXT}; font-size: 16px; font-weight: 700;")
-        self._info.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
-        self._card.setStyleSheet(
-            "QFrame#UsageCard {"
-            "  background: rgba(50, 240, 140, 0.05);"
-            "  border: 1px solid rgba(50, 240, 140, 0.20);"
-            "  border-radius: 16px;"
-            "}"
-        )
-        self._source_lbl.setStyleSheet(f"color: {_DIM}; font-size: 12px;")
-        self._time_lbl.setStyleSheet(f"color: {_DIM}; font-size: 11px;")
-        self._err_lbl.setStyleSheet(f"color: {_ERROR}; font-size: 12px; padding: 8px 4px;")
-        self._btn_query.setStyleSheet(
-            "QPushButton { padding: 8px 20px; background: rgba(50,240,140,0.15);"
-            f"  border: 1px solid rgba(50,240,140,0.35); border-radius: 8px; color: {_ACCENT};"
-            "  font-size: 13px; font-weight: 600; }"
-            "QPushButton:hover { background: rgba(50,240,140,0.25); }"
-        )
-        for btn, color_getter in self._btns:
-            color = color_getter()
-            btn.setStyleSheet(
-                f"QPushButton {{ padding: 5px 12px; background: rgba(224,226,242,0.05);"
-                f"  border: 1px solid rgba(224,226,242,0.12); border-radius: 6px; color: {color};"
-                f"  font-size: 12px; }}"
-                f"QPushButton:hover {{ background: rgba(224,226,242,0.12); }}"
-            )
-        # 恢复 value_lbl 的正确状态
-        cached = self._bc.cached
-        if cached:
-            self._apply_result(cached)
-        else:
-            self._value_lbl.setStyleSheet(f"color: {_ACCENT}; font-size: 42px; font-weight: 800;")
-
-    def _query(self, force: bool = False) -> None:
-        self._btn_query.setEnabled(False)
-        self._btn_force.setEnabled(False)
-        self._value_lbl.setText("查询中...")
-        self._value_lbl.setStyleSheet(f"color: {_MUTED}; font-size: 42px; font-weight: 800;")
-
-        def _cb(result: BalanceResult) -> None:
-            # 回到 UI 线程
-            QTimer.singleShot(0, lambda: self._apply_cb(result))
-
-        self._bc.query_async(_cb, force=force)
-
-    def _apply_cb(self, result: BalanceResult) -> None:
-        self._apply_result(result)
-        self._btn_query.setEnabled(True)
-        self._btn_force.setEnabled(True)
-        # 如果首选失败且没有临时 Key，提示用户
-        if not result.is_available and not self._bc._temp_api_key:
-            if QMessageBox.question(
-                self, "DSH 代理查询失败",
-                f"{result.error}\n\n是否立即设置降级通道临时 API Key（仅本次会话内存，不落盘）？",
-            ) == QMessageBox.StandardButton.Yes:
-                self._set_temp_key()
-
-    def _set_temp_key(self) -> None:
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox
-        if self._temp_key_dialog_open:
-            return
-        dlg = QDialog(self)
-        dlg.setWindowTitle("设置降级通道临时 API Key")
-        dlg.setMinimumWidth(460)
-        lay = QVBoxLayout(dlg)
-        tip = QLabel(
-            "该 Key <b>仅在本次会话内存中存活</b>，绝不写入磁盘或日志。\n"
-            "关闭应用即失效。用于 DSH 代理不可用时的平台直连降级。"
-        )
-        tip.setStyleSheet("color: #FFB454; font-size: 12px;")
-        tip.setWordWrap(True)
-        lay.addWidget(tip)
-        input_le = QLineEdit()
-        input_le.setPlaceholderText("sk-xxxxxxxxxxxxxxxxxxxxxxxx")
-        input_le.setEchoMode(QLineEdit.EchoMode.Password)
-        input_le.setStyleSheet(
-            "QLineEdit { padding: 8px 12px; background: rgba(224,226,242,0.05);"
-            "  border: 1px solid rgba(224,226,242,0.15); border-radius: 8px; color: #E0E2F2; font-family: 'Consolas', monospace; }"
-        )
-        lay.addWidget(input_le)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("保存（仅内存）")
-        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        btns.accepted.connect(dlg.accept)
-        btns.rejected.connect(dlg.reject)
-        lay.addWidget(btns)
-        self._temp_key_dialog_open = True
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            key = input_le.text().strip()
-            if key:
-                self._bc.set_temp_api_key(key)
-                QMessageBox.information(self, "已设置", "临时 Key 已设置（仅本次会话内存）。可以再次查询余额。")
-        self._temp_key_dialog_open = False
-
-    def _clear_temp_key(self) -> None:
-        self._bc.clear_temp_api_key()
-        QMessageBox.information(self, "已清除", "临时 API Key 已从内存中清除。")
-
-
-# ============================================================
-# 主面板：承载 5 个子页签
-# ============================================================
-class UsagePanel(QWidget):
-    """用量与消耗主面板（与对话区域并列，建议放入 QTabWidget 中）。"""
-
-    def __init__(self, tracker: UsageTracker, balance_client: BalanceClient, parent=None):
+    def __init__(self, tracker: UsageTracker, balance_widget=None, parent: QWidget | None = None):
         super().__init__(parent)
         self._tracker = tracker
-        self._balance_client = balance_client
+        self._balance_widget = balance_widget
+        self._theme_combo: QComboBox | None = None
+        self._dsh_path_edit: QLineEdit | None = None
+        self._workspace_edit: QLineEdit | None = None
+        self._scroll_area: QScrollArea | None = None
         self._setup_ui()
-        # 监听数据变化，自动刷新概览/日历/列表
-        self._tracker.add_listener(self._on_data_changed)
-        # 注册主题监听器：主题切换时刷新所有子页签样式
-        from ..theme.theme_manager import ThemeManager
+
+    def _setup_ui(self) -> None:
+        # 外层：可滚动区域（内容自然铺开，避免固定高度压缩导致文字/控件重叠）
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+
+        content = QWidget()
+        content.setObjectName("SettingsPageContent")
+        content.setAutoFillBackground(False)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        title_lbl = QLabel("设置")
+        title_lbl.setObjectName("SettingsTitle")
+        title_lbl.setStyleSheet(
+            f"color: {_TEXT}; font-size: 18px; font-weight: 700;"
+        )
+        layout.addWidget(title_lbl)
+
+        # API Key
+        grp_key = QGroupBox("API 密钥")
+        key_layout = QVBoxLayout(grp_key)
+        key_layout.setSpacing(10)
+        key_desc = QLabel(
+            "DeepSeek API Key 用于对话调用与余额查询。"
+            " 存储位置：~/.dsh/.credentials.yaml"
+        )
+        key_desc.setObjectName("SettingsHint")
+        key_desc.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+        key_desc.setWordWrap(True)
+        key_layout.addWidget(key_desc)
+
+        key_row = QHBoxLayout()
+        self._key_status_lbl = QLabel("尚未读取")
+        self._key_status_lbl.setObjectName("SettingsKeyStatus")
+        self._key_status_lbl.setStyleSheet(
+            f"color: {_DIM}; font-size: 12px; font-family: Consolas, monospace;"
+        )
+        key_row.addWidget(self._key_status_lbl, stretch=1)
+
+        self._read_key_btn = QPushButton("读取")
+        self._read_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._read_key_btn.clicked.connect(self._on_read_key)
+        key_row.addWidget(self._read_key_btn)
+
+        self._set_key_btn = QPushButton("设置 / 修改")
+        self._set_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_key_btn.clicked.connect(self._on_set_key)
+        key_row.addWidget(self._set_key_btn)
+        key_wrap = QWidget()
+        key_wrap.setLayout(key_row)
+        key_layout.addWidget(key_wrap)
+        layout.addWidget(grp_key)
+
+        # 主题
+        grp_theme = QGroupBox("主题")
+        theme_layout = QFormLayout(grp_theme)
+        theme_layout.setSpacing(10)
+
+        self._theme_combo = QComboBox()
         tm = ThemeManager()
-        tm.add_listener(self.apply_theme)
-        # 立即应用当前主题
-        if tm._current:
-            self.apply_theme(tm._current)
+        try:
+            tm.load_all()
+        except Exception:
+            pass
+        for key_name, display_name in tm.theme_keys.items():
+            cn = tm.cn_display_name(key_name)
+            label = cn if cn != display_name else display_name
+            self._theme_combo.addItem(label, key_name)
+        # 表单左侧标签也挂 objectName 以便 apply_theme 统一刷新
+        theme_row_label = QLabel("配色方案：")
+        theme_row_label.setObjectName("SettingsFormLabel")
+        theme_layout.addRow(theme_row_label, self._theme_combo)
+
+        self._preview_hint_cb = QCheckBox("背景图可读性自动保护")
+        self._preview_hint_cb.setChecked(True)
+        theme_layout.addRow(self._preview_hint_cb)
+        layout.addWidget(grp_theme)
+
+        # 路径
+        grp_path = QGroupBox("路径与工作区")
+        path_layout = QFormLayout(grp_path)
+        path_layout.setSpacing(10)
+
+        self._dsh_path_edit = QLineEdit()
+        self._dsh_path_edit.setPlaceholderText("DSH 工作目录（可选，留空使用 ~/.dsh-work/）")
+        dsh_label = QLabel("DSH 数据路径：")
+        dsh_label.setObjectName("SettingsFormLabel")
+        path_layout.addRow(dsh_label, self._dsh_path_edit)
+
+        ws_row = QHBoxLayout()
+        self._workspace_edit = QLineEdit()
+        self._workspace_edit.setPlaceholderText("默认工作区目录")
+        ws_row.addWidget(self._workspace_edit, stretch=1)
+        self._ws_browse_btn = QPushButton("选择...")
+        self._ws_browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ws_browse_btn.clicked.connect(self._on_browse_ws)
+        ws_row.addWidget(self._ws_browse_btn)
+        ws_wrap = QWidget()
+        ws_wrap.setLayout(ws_row)
+        ws_label = QLabel("默认工作区：")
+        ws_label.setObjectName("SettingsFormLabel")
+        path_layout.addRow(ws_label, ws_wrap)
+
+        layout.addWidget(grp_path)
+
+        # 杂项
+        grp_misc = QGroupBox("杂项")
+        misc_layout = QFormLayout(grp_misc)
+        misc_layout.setSpacing(10)
+
+        self._auto_start_cb = QCheckBox("系统启动时自动运行 DSH Work")
+        misc_layout.addRow(self._auto_start_cb)
+
+        self._minimize_tray_cb = QCheckBox("关闭窗口时最小化到系统托盘")
+        self._minimize_tray_cb.setChecked(True)
+        misc_layout.addRow(self._minimize_tray_cb)
+
+        self._check_updates_cb = QCheckBox("启动时自动检查更新")
+        self._check_updates_cb.setChecked(True)
+        misc_layout.addRow(self._check_updates_cb)
+
+        layout.addWidget(grp_misc)
+
+        layout.addStretch()
+
+        # 保存
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._cancel_btn = QPushButton("取消")
+        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel_btn.clicked.connect(self._on_reload)
+        btn_row.addWidget(self._cancel_btn)
+
+        self._save_btn = QPushButton("保存设置")
+        self._save_btn.setObjectName("Primary")
+        self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(self._save_btn)
+        btn_wrap = QWidget()
+        btn_wrap.setLayout(btn_row)
+        layout.addWidget(btn_wrap)
+
+        # 挂载滚动区
+        outer.addWidget(scroll)
+        scroll.setWidget(content)
+        self._scroll_area = scroll
+
+        self.apply_theme()
+        QTimer.singleShot(80, self._on_reload)
+        QTimer.singleShot(120, self._refresh_key_status)
+
+    # ---- API Key ----
+
+    def _creds_path(self) -> Path:
+        return Path.home() / ".dsh" / ".credentials.yaml"
+
+    def _refresh_key_status(self) -> None:
+        try:
+            p = self._creds_path()
+            if not p.is_file():
+                self._key_status_lbl.setText("未配置")
+                self._key_status_lbl.setStyleSheet(
+                    f"color: {_WARNING}; font-size: 12px; font-family: Consolas, monospace;"
+                )
+                return
+            txt = p.read_text(encoding="utf-8")
+            m = re.search(r"DEEPSEEK_API_KEY\s*:\s*['\"]?([^'\"\n]+)", txt)
+            if not m or not m.group(1).strip():
+                self._key_status_lbl.setText("凭据文件存在但未找到 Key")
+                self._key_status_lbl.setStyleSheet(
+                    f"color: {_WARNING}; font-size: 12px; font-family: Consolas, monospace;"
+                )
+                return
+            k = m.group(1).strip()
+            masked = k[:6] + "…" + k[-4:] if len(k) > 12 else "sk-****"
+            self._key_status_lbl.setText(f"已配置  ({masked})")
+            self._key_status_lbl.setStyleSheet(
+                f"color: {_ACCENT}; font-size: 12px; font-family: Consolas, monospace;"
+            )
+        except Exception as ex:
+            self._key_status_lbl.setText(f"读取异常：{ex}")
+            self._key_status_lbl.setStyleSheet(
+                f"color: {_ERROR}; font-size: 12px; font-family: Consolas, monospace;"
+            )
+
+    def _current_key(self) -> str:
+        try:
+            p = self._creds_path()
+            if not p.is_file():
+                return ""
+            txt = p.read_text(encoding="utf-8")
+            m = re.search(r"DEEPSEEK_API_KEY\s*:\s*['\"]?([^'\"\n]+)", txt)
+            return m.group(1).strip() if m else ""
+        except Exception:
+            return ""
+
+    def _on_read_key(self) -> None:
+        self._refresh_key_status()
+        self._toast("已重新读取凭据状态", _ACCENT)
+
+    def _on_set_key(self) -> None:
+        dlg = _ApiKeyDialog(self)
+        dlg.set_initial_key(self._current_key())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_key = dlg.get_key()
+        try:
+            import yaml
+            p = self._creds_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if p.is_file():
+                try:
+                    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    data = {}
+            if new_key:
+                data["DEEPSEEK_API_KEY"] = new_key
+            else:
+                data.pop("DEEPSEEK_API_KEY", None)
+            with open(p, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+            self._refresh_key_status()
+            self._toast("API Key 已写入凭据文件", _ACCENT)
+        except Exception as ex:
+            log.warning("写入 API Key 失败: %s", ex)
+            self._toast(f"写入失败：{ex}", _ERROR)
+
+    # ---- 路径 ----
+
+    def _on_browse_ws(self) -> None:
+        current = (self._workspace_edit.text() if self._workspace_edit else "").strip()
+        start_dir = current or str(Path.home())
+        d = QFileDialog.getExistingDirectory(self, "选择工作区目录", start_dir)
+        if d and self._workspace_edit:
+            self._workspace_edit.setText(d)
+
+    # ---- 配置装载/保存 ----
+
+    def _cfg(self):
+        try:
+            from ...config import UserConfig
+            return UserConfig.load()
+        except Exception:
+            return None
+
+    def _on_reload(self) -> None:
+        cfg = self._cfg()
+        if cfg is None:
+            return
+        # 主题下拉
+        if self._theme_combo is not None:
+            theme_key = getattr(cfg, "theme", "") or ""
+            for i in range(self._theme_combo.count()):
+                if self._theme_combo.itemData(i) == theme_key:
+                    self._theme_combo.setCurrentIndex(i)
+                    break
+        # 路径
+        if self._dsh_path_edit is not None:
+            self._dsh_path_edit.setText(getattr(cfg, "custom_dsh_endpoint", "") or "")
+        if self._workspace_edit is not None:
+            self._workspace_edit.setText(getattr(cfg, "workspace", "") or "")
+        # 复选框
+        try:
+            self._preview_hint_cb.setChecked(bool(getattr(cfg, "readability_protection", True)))
+        except Exception:
+            pass
+        try:
+            self._minimize_tray_cb.setChecked(bool(getattr(cfg, "minimize_to_tray", True)))
+        except Exception:
+            pass
+        try:
+            self._check_updates_cb.setChecked(bool(getattr(cfg, "check_updates", True)))
+        except Exception:
+            pass
+
+    def _on_save(self) -> None:
+        cfg = self._cfg()
+        if cfg is None:
+            self._toast("无法访问用户配置", _ERROR)
+            return
+        try:
+            if self._theme_combo is not None:
+                new_key = self._theme_combo.currentData()
+                if new_key:
+                    tm = ThemeManager()
+                    theme = tm.set_current(new_key)
+                    if theme:
+                        from PySide6.QtWidgets import QApplication
+                        try:
+                            qss = tm.generate_qss(theme)
+                            QApplication.instance().setStyleSheet(qss)
+                        except Exception:
+                            pass
+                    try:
+                        cfg.theme = new_key
+                    except Exception:
+                        pass
+            try:
+                cfg.custom_dsh_endpoint = (
+                    self._dsh_path_edit.text().strip() if self._dsh_path_edit else ""
+                )
+            except Exception:
+                pass
+            try:
+                cfg.workspace = (
+                    self._workspace_edit.text().strip() if self._workspace_edit else ""
+                )
+            except Exception:
+                pass
+            try:
+                cfg.readability_protection = self._preview_hint_cb.isChecked()
+            except Exception:
+                pass
+            try:
+                cfg.minimize_to_tray = self._minimize_tray_cb.isChecked()
+            except Exception:
+                pass
+            try:
+                cfg.check_updates = self._check_updates_cb.isChecked()
+            except Exception:
+                pass
+            try:
+                cfg.save()
+            except Exception as ex:
+                self._toast(f"保存配置失败：{ex}", _ERROR)
+                return
+            self._toast("设置已保存", _ACCENT)
+        except Exception as ex:
+            log.warning("保存设置失败: %s", ex)
+            self._toast(f"保存异常：{ex}", _ERROR)
+
+    # ---- 其他 ----
+
+    def _toast(self, text: str, color: str) -> None:
+        try:
+            parent_win = self.window()
+            sb = getattr(parent_win, "status_bar", None)
+            if sb is not None and hasattr(sb, "show_temporary"):
+                sb.show_temporary(text, color=color, duration_ms=2200)
+                return
+        except Exception:
+            pass
+        log.info("[SettingsTab] %s", text)
+
+    def apply_theme(self, theme=None) -> None:
+        if theme is not None:
+            _apply_theme_colors(theme)
+
+        if self._theme_combo is not None:
+            self._theme_combo.setStyleSheet(
+                f"QComboBox {{ padding: 4px 10px; background: {_SOFT_BG};"
+                f" border: 1px solid {_INPUT_BORDER}; border-radius: 6px; color: {_TEXT}; }}"
+                f"QComboBox QAbstractItemView {{ background: {_BG_SECONDARY}; color: {_TEXT};"
+                f" selection-background-color: {_ACCENT}; border: 1px solid {_INPUT_BORDER}; }}"
+            )
+        for le in (self._dsh_path_edit, self._workspace_edit):
+            if le is None:
+                continue
+            le.setStyleSheet(
+                f"QLineEdit {{ padding: 6px 10px; background: {_SOFT_BG};"
+                f" border: 1px solid {_INPUT_BORDER}; border-radius: 6px; color: {_TEXT}; }}"
+            )
+
+        btn_style = (
+            f"QPushButton {{ padding: 5px 12px; background: {_SOFT_BG};"
+            f" border: 1px solid {_BTN_BORDER}; border-radius: 6px; color: {_TEXT}; }}"
+            f"QPushButton:hover {{ background: {_HARD_BG}; }}"
+        )
+        for b in (self._read_key_btn, self._set_key_btn, self._ws_browse_btn,
+                   self._cancel_btn):
+            if b is not None:
+                b.setStyleSheet(btn_style)
+        if self._save_btn is not None:
+            self._save_btn.setStyleSheet(
+                f"QPushButton {{ padding: 5px 16px; background: {_ACCENT};"
+                f" border: none; border-radius: 6px; color: {_BG_PRIMARY};"
+                f" font-weight: 600; }}"
+                f"QPushButton:hover {{ background: {_rgba_from_hex(_ACCENT, 0.85)}; }}"
+            )
+
+        grp_style = (
+            f"QGroupBox {{ color: {_TEXT}; font-size: 13px; font-weight: 600;"
+            f" border: 1px solid {_PANEL_BORDER}; border-radius: 10px;"
+            f" margin-top: 10px; padding-top: 8px; background: {_TAB_PANE_BG}; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; }}"
+        )
+        for c in self.findChildren(QGroupBox):
+            c.setStyleSheet(grp_style)
+
+        for cb in self.findChildren(QCheckBox):
+            cb.setStyleSheet(
+                f"QCheckBox {{ color: {_TEXT}; spacing: 6px; }}"
+                f"QCheckBox::indicator {{ width: 14px; height: 14px; border-radius: 3px;"
+                f" border: 1px solid {_INPUT_BORDER}; background: {_SOFT_BG}; }}"
+                f"QCheckBox::indicator:checked {{ background: {_ACCENT}; border-color: {_ACCENT}; }}"
+            )
+
+        # ===== 所有 QLabel 按 objectName 统一刷新主题色 =====
+        # 标题
+        for lbl in self.findChildren(QLabel, "SettingsTitle"):
+            lbl.setStyleSheet(
+                f"color: {_TEXT}; font-size: 18px; font-weight: 700;"
+            )
+        # 表单左侧静态标签（"配色方案："、"DSH 数据路径："、"默认工作区："）
+        for lbl in self.findChildren(QLabel, "SettingsFormLabel"):
+            lbl.setStyleSheet(f"color: {_TEXT};")
+        # 提示文本（API Key 区描述）
+        for lbl in self.findChildren(QLabel, "SettingsHint"):
+            lbl.setStyleSheet(f"color: {_MUTED}; font-size: 12px;")
+        # Key 状态标签：只在没被 _refresh_key_status 单独染色时才统一刷新
+        for lbl in self.findChildren(QLabel, "SettingsKeyStatus"):
+            # 如果没有单独 objectName 冲突，保持 _refresh_key_status 动态结果即可
+            pass
+
+
+# ===== UsagePanel（主容器）=====
+
+class UsagePanel(QWidget):
+    """用量与消耗主面板（QTabWidget 承载 4 个标签页）。"""
+
+    def __init__(self, tracker: UsageTracker, balance_widget=None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("UsagePanel")
+        self._tracker = tracker
+        self._balance_widget = balance_widget
+
+        self._overview_tab: _OverviewTab | None = None
+        self._models_tab: _ModelsTab | None = None
+        self._billing_tab: _BillingTab | None = None
+        self._settings_tab: _SettingsTab | None = None
+        self._tab_widget: QTabWidget | None = None
+
+        self._setup_ui()
+
+        # 主题监听
+        tm = ThemeManager()
+        try:
+            tm.add_listener(self.apply_theme)
+        except Exception as ex:
+            log.warning("注册主题监听器失败: %s", ex)
+
+        # tracker 变化通知
+        try:
+            if hasattr(self._tracker, "add_listener"):
+                self._tracker.add_listener(self._on_tracker_changed)
+        except Exception as ex:
+            log.warning("注册 tracker 监听器失败: %s", ex)
+
+        # 初始化时同步当前主题
+        try:
+            cur = tm.current
+            if cur is not None:
+                self.apply_theme(cur)
+        except Exception:
+            pass
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._tabs = QTabWidget()
-        # 不用 documentMode：Windows 下 documentMode 会启用原生绘制，导致 Tab 栏背景白色、不受 QSS 控制
-        self._tabs.setStyleSheet(
-            "QTabWidget::pane { border: none; }"
-            "QTabBar::tab {"
-            f"  padding: 10px 22px; font-size: 13px; color: {_MUTED};"
-            "  background: transparent; border: none; border-bottom: 2px solid transparent;"
-            "}"
-            f"QTabBar::tab:selected {{ color: {_ACCENT}; border-bottom-color: {_ACCENT}; font-weight: 600; }}"
-            f"QTabBar::tab:hover:!selected {{ color: {_TEXT}; background: rgba(224,226,242,0.04); }}"
-            "QTabBar::tab-bar { alignment: left; padding-left: 16px; }"
-        )
+        self._tab_widget = QTabWidget()
+        self._tab_widget.setTabPosition(QTabWidget.TabPosition.North)
+        self._tab_widget.setDocumentMode(False)
 
-        self._overview = _OverviewTab(self._tracker)
-        self._tabs.addTab(self._overview, "📊 概览")
+        self._overview_tab = _OverviewTab(self._tracker)
+        self._tab_widget.addTab(self._overview_tab, "概览")
 
-        self._calendar = _CalendarTab(self._tracker)
-        self._tabs.addTab(self._calendar, "🗓 用量日历")
+        self._models_tab = _ModelsTab(self._tracker)
+        self._tab_widget.addTab(self._models_tab, "模型价格")
 
-        self._records = _RecordsTab(self._tracker)
-        self._tabs.addTab(self._records, "📋 记录列表")
+        self._billing_tab = _BillingTab(self._tracker)
+        self._tab_widget.addTab(self._billing_tab, "计费设置")
 
-        self._pricing = _PricingTab(self._tracker)
-        self._pricing.pricing_changed.connect(self._on_pricing_changed)
-        self._tabs.addTab(self._pricing, "💰 价格表")
+        self._settings_tab = _SettingsTab(self._tracker, self._balance_widget)
+        self._tab_widget.addTab(self._settings_tab, "设置")
 
-        self._balance = _BalanceTab(self._balance_client)
-        self._tabs.addTab(self._balance, "💳 余额查询")
+        layout.addWidget(self._tab_widget, stretch=1)
+        self.apply_theme()
 
-        layout.addWidget(self._tabs)
+    def _on_tracker_changed(self) -> None:
+        """用量记录变化 → 只刷新概览页，其他页懒加载。"""
+        if self._overview_tab is not None:
+            try:
+                self._overview_tab.refresh()
+            except Exception as ex:
+                log.warning("刷新概览失败: %s", ex)
 
-    # 当 tracker 有新记录或价格表变化时，懒刷新当前子页签
-    def _on_data_changed(self) -> None:
-        idx = self._tabs.currentIndex()
-        try:
-            if idx == 0:
-                self._overview.refresh()
-            elif idx == 1:
-                self._calendar.refresh()
-            elif idx == 2:
-                self._records.refresh()
-        except Exception as e:
-            log.warning("UsagePanel 自动刷新异常: %s", e)
+    # ---- 主题转发 ----
 
-    def _on_pricing_changed(self) -> None:
-        # 价格表变化后，所有聚合都要刷新
-        self._overview.refresh()
-        self._calendar.refresh()
-        self._records.refresh()
+    def apply_theme(self, theme=None) -> None:
+        """应用主题：先更新模块颜色，再转发到每个子页。"""
+        if theme is None:
+            tm = ThemeManager()
+            theme = getattr(tm, "current", None) or theme
+        if theme is not None:
+            _apply_theme_colors(theme)
 
-    def apply_theme(self, theme) -> None:
-        """主题切换：更新模块级颜色变量，刷新主 Tab 样式，并级联到所有子页签。"""
-        _apply_theme_colors(theme)
-        self._tabs.setStyleSheet(
-            "QTabWidget::pane { border: none; }"
-            "QTabBar::tab {"
-            f"  padding: 10px 22px; font-size: 13px; color: {_MUTED};"
-            "  background: transparent; border: none; border-bottom: 2px solid transparent;"
-            "}"
-            f"QTabBar::tab:selected {{ color: {_ACCENT}; border-bottom-color: {_ACCENT}; font-weight: 600; }}"
-            f"QTabBar::tab:hover:!selected {{ color: {_TEXT}; background: rgba(224,226,242,0.04); }}"
-            "QTabBar::tab-bar { alignment: left; padding-left: 16px; }"
-        )
-        self._overview.apply_theme(theme)
-        self._calendar.apply_theme(theme)
-        self._records.apply_theme(theme)
-        self._pricing.apply_theme(theme)
-        self._balance.apply_theme(theme)
+        if self._tab_widget is not None:
+            pane_bg = _TAB_PANE_BG
+            self._tab_widget.setStyleSheet(
+                f"QTabWidget {{ background: transparent; border: none; }}"
+                f"QTabWidget::pane {{ background: {pane_bg};"
+                f" border: 1px solid {_PANEL_BORDER}; border-radius: 10px; top: -1px; padding: 0; }}"
+                f"QTabBar::tab {{ padding: 6px 16px; background: {_SOFT_BG}; color: {_MUTED};"
+                f" border: 1px solid {_TAB_BORDER}; border-bottom: none; margin-right: 4px;"
+                f" border-top-left-radius: 8px; border-top-right-radius: 8px; font-size: 13px; }}"
+                f"QTabBar::tab:selected {{ background: {pane_bg}; color: {_TEXT};"
+                f" border-color: {_PANEL_BORDER}; border-bottom: 1px solid {pane_bg};"
+                f" font-weight: 600; }}"
+                f"QTabBar::tab:hover:!selected {{ color: {_TEXT}; background: {_SOFT_BG}; }}"
+            )
+
+        for tab in (self._overview_tab, self._models_tab,
+                     self._billing_tab, self._settings_tab):
+            if tab is None:
+                continue
+            try:
+                tab.apply_theme(theme)
+            except Exception as ex:
+                log.warning("转发主题到子页失败: %s", ex)
+
+
+__all__ = ["UsagePanel"]

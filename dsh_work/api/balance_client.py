@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
@@ -87,6 +88,8 @@ class BalanceClient:
         self._cached: BalanceResult | None = None
         self._last_query_time: float = 0
         self._lock = threading.Lock()
+        # 异步查询线程池：复用线程，避免每次都 new Thread()（降低线程创建开销）
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="balance-query")
 
         # 降级通道临时 Key：仅内存中存活，会话结束即清除
         self._temp_api_key: str | None = None
@@ -234,11 +237,23 @@ class BalanceClient:
     def query_async(self, callback: Callable[[BalanceResult], None], force: bool = False) -> None:
         """异步查询余额，结果通过回调返回（避免阻塞 UI）。"""
         def _worker():
-            result = self.query(force=force)
-            callback(result)
+            try:
+                result = self.query(force=force)
+            except Exception as e:  # 兜底：回调异常不导致线程池崩溃
+                log.warning("异步余额查询异常: %s", e)
+                result = BalanceResult(
+                    balance=0.0,
+                    source=BalanceSource.UNAVAILABLE,
+                    is_available=False,
+                    error=str(e),
+                    queried_at=time.time(),
+                )
+            try:
+                callback(result)
+            except Exception as e:
+                log.warning("余额查询回调异常: %s", e)
 
-        t = threading.Thread(target=_worker, daemon=True, name="balance-query")
-        t.start()
+        self._executor.submit(_worker)
 
     @property
     def cached(self) -> BalanceResult | None:
@@ -247,5 +262,6 @@ class BalanceClient:
     def close(self) -> None:
         """关闭客户端，清除临时 Key。"""
         self.clear_temp_api_key()
+        self._executor.shutdown(wait=False)
         self._direct_session.close()
         log.info("余额客户端已关闭")

@@ -91,8 +91,8 @@ class ScenarioPicker(QDialog):
         hover_bg = "rgba(123, 184, 255, 0.08)" if is_code else "rgba(50, 240, 140, 0.08)"
         card.setStyleSheet(f"""
             QFrame {{
-                background-color: rgba(224, 226, 242, 0.03);
-                border: 1px solid rgba(224, 226, 242, 0.1);
+                background-color: transparent;
+                border: 1px solid #B5BDC5;
                 border-radius: 10px;
             }}
             QFrame:hover {{

@@ -127,7 +127,9 @@ class HttpClient:
             "payload": payload,
         }
         url = f"{self.endpoint_prefix}/{method}"
-        log.debug("RPC → %s payload=%s", method, _truncate_params(payload))
+        # 懒加载：仅 debug 开启时才序列化 params（避免每次 RPC 都做 repr + 截断）
+        if log.isEnabledFor(10):  # DEBUG
+            log.debug("RPC → %s payload=%s", method, _truncate_params(payload))
         try:
             resp = self._session.post(
                 url,

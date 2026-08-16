@@ -34,6 +34,8 @@ log = get_logger("core.dsh_downloader")
 
 # 行级日志回调（与 ProcessManager._emit_log 同签名）
 LogCb = Callable[[str], None]
+# 结构化进度回调：(done_bytes, total_bytes)；total_bytes=0 表示未知大小（UI 用不确定模式）
+ProgressCb = Callable[[int, int], None]
 
 
 def _platform_tag() -> str:
@@ -130,8 +132,13 @@ def is_runtime_ready() -> bool:
 # ===== 下载 =====
 
 
-def _download(url: str, dest: Path, log_cb: LogCb, timeout: int) -> bool:
-    """流式下载并显示进度，下载到 .part 再原子重命名。"""
+def _download(url: str, dest: Path, log_cb: LogCb, timeout: int,
+              progress_cb: Optional[ProgressCb] = None) -> bool:
+    """流式下载并显示进度，下载到 .part 再原子重命名。
+
+    progress_cb(done_bytes, total_bytes)：每写入一个 chunk 调用一次，
+    total_bytes=0 表示响应头未返回 Content-Length（UI 用不确定模式）。
+    """
     import requests
 
     log_cb(f"下载: {url}")
@@ -151,6 +158,13 @@ def _download(url: str, dest: Path, log_cb: LogCb, timeout: int) -> bool:
                 if chunk:
                     f.write(chunk)
                     done += len(chunk)
+                    # 结构化进度回调（UI 端可自行节流）
+                    if progress_cb:
+                        try:
+                            progress_cb(done, total)
+                        except Exception:
+                            pass
+                    # 日志：每 10% 打印一次，避免日志框刷屏
                     if total:
                         pct = done * 100 // total
                         if pct != last_pct and pct % 10 == 0:
@@ -195,7 +209,8 @@ def _flatten(node_dir: Path, log_cb: LogCb) -> None:
         log_cb(f"已展平 {sub.name} 到运行时根")
 
 
-def download_portable_node(log_cb: LogCb) -> Optional[Path]:
+def download_portable_node(log_cb: LogCb,
+                           progress_cb: Optional[ProgressCb] = None) -> Optional[Path]:
     """下载并解压便携 Node.js，返回 node 可执行文件路径，失败返回 None。"""
     if get_node_bin():
         log_cb(f"便携 Node 已存在: {get_node_dir()}")
@@ -207,7 +222,7 @@ def download_portable_node(log_cb: LogCb) -> Optional[Path]:
 
     with tempfile.TemporaryDirectory() as td:
         archive = Path(td) / Path(url).name
-        if not _download(url, archive, log_cb, C.NODE_DOWNLOAD_TIMEOUT_SEC):
+        if not _download(url, archive, log_cb, C.NODE_DOWNLOAD_TIMEOUT_SEC, progress_cb):
             return None
         if not _extract(archive, node_dir, log_cb):
             return None
@@ -346,14 +361,15 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
-def ensure_runtime(log_cb: LogCb) -> Optional[list[str]]:
+def ensure_runtime(log_cb: LogCb,
+                   progress_cb: Optional[ProgressCb] = None) -> Optional[list[str]]:
     """确保本地运行时就绪（缺则下载/安装），返回 dsh 启动命令或 None。"""
     cmd = get_dsh_command()
     if cmd:
         log_cb("本地运行时就绪")
         return cmd
     if not get_node_bin():
-        if not download_portable_node(log_cb):
+        if not download_portable_node(log_cb, progress_cb):
             return None
     if not get_local_dsh_entry():
         if not install_dsh_local(log_cb):

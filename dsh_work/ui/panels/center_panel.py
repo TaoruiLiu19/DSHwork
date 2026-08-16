@@ -1,6 +1,6 @@
 """中栏：对话/工作区主区域（第 3.3 节）。
 
-由三部分组成：消息流、输入框、工具调用内联展示。
+由四部分组成：消息流、余额内联小部件、输入框、工具调用内联展示。
 两种模式共享的核心区域，差异在于信息密度和呈现方式。
 """
 
@@ -10,16 +10,18 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QStackedWidget, QLabel
 
 from ...api import MessageRecord
+from ...api.balance_client import BalanceResult
 from ...core.session_manager import AgentStatus, ContextUsage
 from ..widgets.message_list import MessageList
 from ..widgets.input_box import InputBox
 from ..widgets.empty_state_cards import EmptyStateCards
 from ..widgets.tool_call_card import ToolCallAggregator, ToolCallCard
+from ..widgets.balance_widget import BalanceWidget
 from ... import constants as C
 
 
 class CenterPanel(QWidget):
-    """中栏：对话区域 + 输入框。
+    """中栏：对话区域 + 余额小部件 + 输入框。
 
     空状态时显示快捷入口卡片，有消息时显示消息流。
     """
@@ -29,6 +31,7 @@ class CenterPanel(QWidget):
     files_dropped = Signal(list)
     card_clicked = Signal(str, str)  # prompt, mode
     scrolled_to_top = Signal()
+    balance_refresh_requested = Signal()  # 用户点击余额小部件触发强制刷新
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -55,6 +58,11 @@ class CenterPanel(QWidget):
         self._messages_index = self._stack.addWidget(self._message_list)
 
         layout.addWidget(self._stack, stretch=1)
+
+        # 余额内联小部件（消息列表与输入框之间）
+        self._balance_widget = BalanceWidget()
+        self._balance_widget.refresh_requested.connect(self.balance_refresh_requested)
+        layout.addWidget(self._balance_widget)
 
         # 输入框
         self._input_box = InputBox()
@@ -185,3 +193,27 @@ class CenterPanel(QWidget):
     @property
     def message_list(self) -> MessageList:
         return self._message_list
+
+    # ===== 余额内联小部件 =====
+
+    def set_turn_cost(self, turn_cost: float, session_total: float = 0.0) -> None:
+        """更新本轮消耗与会话累计消耗。
+
+        在 TURN_END 事件后由 main_window 调用。
+        """
+        self._balance_widget.set_turn_cost(turn_cost, session_total)
+
+    def set_balance(self, result: BalanceResult) -> None:
+        """更新账户余额显示。
+
+        在余额查询回调后由 main_window 调用。
+        """
+        self._balance_widget.set_balance(result)
+
+    def set_balance_loading(self) -> None:
+        """将余额显示切为「查询中…」状态。"""
+        self._balance_widget.set_balance_loading()
+
+    @property
+    def balance_widget(self) -> BalanceWidget:
+        return self._balance_widget

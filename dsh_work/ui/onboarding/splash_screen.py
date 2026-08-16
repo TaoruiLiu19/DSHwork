@@ -122,30 +122,19 @@ class EnvironmentCheckWorker:
                 f"DSH CLI: {check.dsh_cli_version or '未检测到'}",
             )
 
-            # 未检测到 CLI 且 Node.js 可用 → 自动安装（傻瓜式）
-            if not check.dsh_cli_ok and check.node_ok and not self._aborted:
-                self._set_progress(45, "首次启动：正在自动安装 DSH CLI...")
-                self._add_log("DSH CLI 未安装，开始自动安装...")
-                install_ok = self.process_manager.install_dsh_cli()
-                if install_ok:
-                    # 安装成功，重新检测版本
-                    check.dsh_cli_ok, check.dsh_cli_version = (
-                        self.process_manager._check_dsh_cli()
-                    )
-                    if check.dsh_cli_ok:
-                        self._add_log(f"DSH CLI 安装成功: {check.dsh_cli_version}")
-                    else:
-                        check.errors.append(
-                            "DSH CLI 已安装但无法检测到，请检查 npm 全局 bin 路径是否在 PATH 中"
-                        )
-                else:
-                    check.errors.append(
-                        "DSH CLI 自动安装失败，请手动运行: npm install -g @deepseek-ai/dsh"
-                    )
-                self._set_progress(
-                    int(step / total_steps * 100),
-                    f"DSH CLI: {check.dsh_cli_version or '未检测到'}",
+            # DSH CLI 未安装 → 标记需要下载，由主线程弹出阻塞式下载面板
+            # （避免后台下载时已进入离线模式，用户看不到进度）
+            if not check.dsh_cli_ok and not self._aborted:
+                check.need_download = True
+                # 优先使用便携运行时（local_runtime），下载 Node 阶段有精确百分比进度，
+                # 圆形进度条展示效果更好；npm_global 无精确进度只能用不确定旋转模式
+                check.download_type = "local_runtime"
+                self._add_log("DSH CLI 未安装，需要下载运行环境...")
+                self._add_log(
+                    f"下载类型: {check.download_type}"
+                    + "（便携运行时：下载 Node.js + 本地安装 DSH，有精确进度）"
                 )
+                return self._set_result(check)
 
             if self._aborted:
                 return self._set_result(check)
@@ -265,6 +254,8 @@ class SplashScreen(QDialog):
         self._worker: EnvironmentCheckWorker | None = None
         self._poll_timer: QTimer | None = None
         self._elapsed_log_lines = 0
+        # 防止下载失败后重复弹窗（只尝试一次，失败则进入离线模式）
+        self._download_attempted = False
         self._setup_ui()
         self._start_check()
 
@@ -305,7 +296,7 @@ class SplashScreen(QDialog):
         self._log_view.setStyleSheet(
             "background-color: #1A1B1D; color: #9599A6; "
             "font-family: monospace; font-size: 10px; "
-            "border: 1px solid rgba(224, 226, 242, 0.1); border-radius: 4px;"
+            "border: 1px solid #B5BDC5; border-radius: 4px;"
         )
         layout.addWidget(self._log_view)
 
@@ -369,6 +360,15 @@ class SplashScreen(QDialog):
         if done and result is not None:
             self._poll_timer.stop()
             self._check_result = result
+
+            # 首次启动需要下载 DSH → 弹出阻塞式下载面板
+            # 下载完成后重新检测，避免进入离线模式时下载还在后台跑
+            if result.need_download and not self._download_attempted:
+                self._download_attempted = True
+                self._status_label.setText("需要下载 DSH 运行环境...")
+                self._handle_download(result.download_type)
+                return
+
             if result.all_ok:
                 self._status_label.setText("就绪")
                 self._status_label.setStyleSheet("font-size: 12px; color: #33C192;")
@@ -380,6 +380,37 @@ class SplashScreen(QDialog):
                     self._error_label.setText("\n".join(result.errors))
                 self._error_widget.setVisible(True)
                 QTimer.singleShot(2000, self.accept)
+
+    def _handle_download(self, download_type: str) -> None:
+        """弹出阻塞式下载面板，完成后重新检测环境。
+
+        下载面板内部 daemon 线程执行下载，主线程 QTimer 轮询更新进度。
+        exec() 阻塞直到下载完成（成功/失败），确保用户看到完整进度。
+        """
+        from ..widgets.download_progress_panel import DownloadProgressPanel
+
+        panel = DownloadProgressPanel(self.process_manager, download_type, self)
+        panel.exec()
+
+        if panel.success:
+            # 下载成功，重新检测环境（DSH CLI 应已就绪）
+            self._restart_check()
+        else:
+            # 下载失败，accept 进入离线模式（用户可后续在设置中重试）
+            self._status_label.setText("下载失败，进入离线模式...")
+            QTimer.singleShot(1000, self.accept)
+
+    def _restart_check(self) -> None:
+        """下载完成后重新检测环境（DSH CLI 应已就绪）。"""
+        self._status_label.setText("下载完成，重新检测环境...")
+        self._status_label.setStyleSheet("font-size: 12px; color: #32F08C;")
+        # 重置日志框
+        self._log_view.clear()
+        self._elapsed_log_lines = 0
+        # 新建 worker 做第二次检测
+        self._worker = EnvironmentCheckWorker(self.process_manager, self.workspace)
+        self._worker.start()
+        self._poll_timer.start(100)
 
     def _skip(self) -> None:
         """用户点击跳过。"""

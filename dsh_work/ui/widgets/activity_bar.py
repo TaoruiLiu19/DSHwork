@@ -19,6 +19,40 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont
 
 
+def _theme_colors():
+    try:
+        from ..theme.theme_manager import ThemeManager
+        tm = ThemeManager()
+        theme = tm.current
+        if theme and theme.colors:
+            return theme.colors
+    except Exception:
+        pass
+    return None
+
+
+_FALLBACK = {
+    "bg_secondary": "#0D0D0E",
+    "divider": "#B5BDC5",
+    "bg_hover": "#B5BDC5",
+    "text_primary": "#D1D3DB",
+    "text_muted": "#666B75",
+}
+
+
+def _palette() -> dict:
+    tc = _theme_colors()
+    if tc:
+        return {
+            "bg_secondary": tc.bg_secondary or _FALLBACK["bg_secondary"],
+            "divider": tc.divider or _FALLBACK["divider"],
+            "bg_hover": tc.bg_hover or _FALLBACK["bg_hover"],
+            "text_primary": tc.text_primary or _FALLBACK["text_primary"],
+            "text_muted": tc.text_muted or _FALLBACK["text_muted"],
+        }
+    return dict(_FALLBACK)
+
+
 class ActivityButton(QPushButton):
     """ActivityBar 文字按钮。"""
 
@@ -35,13 +69,14 @@ class ActivityButton(QPushButton):
         self._update_style(False)
 
     def _update_style(self, active: bool) -> None:
+        p = _palette()
         if active:
             self.setStyleSheet(
                 "QPushButton#ActivityButton {"
                 "  background-color: rgba(120, 119, 198, 0.15);"
                 "  border: none;"
                 "  border-radius: 6px;"
-                "  color: #D1D3DB;"
+                f"  color: {p['text_primary']};"
                 "  font-weight: 600;"
                 "  padding: 4px 6px;"
                 "}"
@@ -55,12 +90,12 @@ class ActivityButton(QPushButton):
                 "  background-color: transparent;"
                 "  border: none;"
                 "  border-radius: 6px;"
-                "  color: #666B75;"
+                f"  color: {p['text_muted']};"
                 "  padding: 4px 6px;"
                 "}"
                 "QPushButton#ActivityButton:hover {"
-                "  background-color: rgba(224, 226, 242, 0.08);"
-                "  color: #9599A6;"
+                f"  background-color: {p['bg_hover']};"
+                f"  color: {p['text_primary']};"
                 "}"
             )
 
@@ -76,7 +111,8 @@ class ActivitySeparator(QFrame):
         super().__init__(parent)
         self.setFixedHeight(1)
         self.setFixedWidth(28)
-        self.setStyleSheet("background-color: rgba(224, 226, 242, 0.08);")
+        p = _palette()
+        self.setStyleSheet(f"background-color: {p['divider']};")
 
 
 class ActivityBar(QWidget):
@@ -98,14 +134,30 @@ class ActivityBar(QWidget):
         self.setFixedWidth(48)
         self._current_nav = "sessions"
         self._setup_ui()
+        self.apply_theme()
 
-    def _setup_ui(self) -> None:
+        try:
+            from ..theme.theme_manager import ThemeManager
+            ThemeManager().add_listener(self.apply_theme)
+        except Exception:
+            pass
+
+    def apply_theme(self, theme=None) -> None:
+        """刷新样式表为当前主题配色。"""
+        p = _palette()
         self.setStyleSheet(
             "QWidget#ActivityBar {"
-            "  background-color: #0D0D0E;"
-            "  border-right: 1px solid rgba(224, 226, 242, 0.06);"
+            f"  background-color: {p['bg_secondary']};"
+            f"  border-right: 1px solid {p['divider']};"
             "}"
         )
+        for btn_id in ["_sessions_btn", "_files_btn", "_search_btn", "_git_btn", "_theme_btn", "_settings_btn"]:
+            btn = getattr(self, btn_id, None)
+            if btn is not None:
+                btn._update_style(btn.isChecked())
+
+    def _setup_ui(self) -> None:
+        self.apply_theme()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 8, 4, 8)

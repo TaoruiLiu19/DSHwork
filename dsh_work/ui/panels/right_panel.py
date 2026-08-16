@@ -24,6 +24,36 @@ from ... import constants as C
 from ..widgets.inline_preview import InlinePreview
 
 
+def _theme_colors():
+    try:
+        from ..theme.theme_manager import ThemeManager
+        tm = ThemeManager()
+        theme = tm.current
+        if theme and theme.colors:
+            return theme.colors
+    except Exception:
+        pass
+    return None
+
+
+_FALLBACK = {
+    "text_primary": "#D1D3DB",
+    "text_muted": "#666B75",
+    "bg_hover": "#B5BDC5",
+}
+
+
+def _palette() -> dict:
+    tc = _theme_colors()
+    if tc:
+        return {
+            "text_primary": tc.text_primary or _FALLBACK["text_primary"],
+            "text_muted": tc.text_muted or _FALLBACK["text_muted"],
+            "bg_hover": tc.bg_hover or _FALLBACK["bg_hover"],
+        }
+    return dict(_FALLBACK)
+
+
 class ToolCallTimeline(QListWidget):
     """Code 模式工具调用详情时间线。
 
@@ -128,17 +158,18 @@ class RightPanel(QWidget):
         close_btn.setFixedSize(20, 20)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setToolTip("关闭面板 (Ctrl+J)")
+        p = _palette()
         close_btn.setStyleSheet(
             "QPushButton {"
             "  background-color: transparent;"
             "  border: none;"
             "  border-radius: 4px;"
-            "  color: #666B75;"
+            f"  color: {p['text_muted']};"
             "  font-size: 14px;"
             "}"
             "QPushButton:hover {"
-            "  background-color: rgba(224, 226, 242, 0.1);"
-            "  color: #D1D3DB;"
+            f"  background-color: {p['bg_hover']};"
+            f"  color: {p['text_primary']};"
             "}"
         )
         close_btn.clicked.connect(self.close_requested)

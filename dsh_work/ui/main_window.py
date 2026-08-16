@@ -188,6 +188,8 @@ class MainWindow(QMainWindow):
         self.center_panel.card_clicked.connect(self._on_card_clicked)
         self.center_panel.scrolled_to_top.connect(self._on_scrolled_to_top)
         self.center_panel.files_dropped.connect(self._on_files_dropped)
+        # 余额内联小部件：点击刷新
+        self.center_panel.balance_refresh_requested.connect(self._action_refresh_balance)
 
         # 左栏：新建会话按钮 + 关闭面板 + 会话切换 + 文件双击 + 删除/重命名
         self.left_panel.new_session_requested.connect(self._action_new_session)
@@ -242,6 +244,14 @@ class MainWindow(QMainWindow):
                     tray.messageClicked.connect(self._on_restore)
                 except Exception:  # 老版 Qt 没有该信号时静默
                     pass
+
+        # 余额内联小部件：初始化显示 + 延迟首次查询（避免与 DSH 初始化抢资源）
+        self.center_panel.set_turn_cost(0.0, 0.0)
+        self.center_panel.set_balance_loading()
+        QTimer.singleShot(
+            C.UPDATE_CHECK_DELAY_MS,
+            lambda: self._query_balance_async(force=False),
+        )
 
     @staticmethod
     def _mode_to_preset(mode: str) -> str:
@@ -522,6 +532,8 @@ class MainWindow(QMainWindow):
         self.status_bar.set_token_usage(
             state.context.prompt_tokens, state.context.completion_tokens
         )
+        # 余额内联小部件：本轮消耗 + 会话累计
+        self.center_panel.set_turn_cost(state.last_turn_cost, state.session_total_cost)
 
         # 事件特定路由：根据 last_event_type 把数据送到对应 UI 组件
         # （修复前所有事件只更新状态栏，消息流/工具卡片/预览均不刷新）
@@ -555,6 +567,8 @@ class MainWindow(QMainWindow):
             elif finalized is not None:
                 # 无流式气泡但有固化消息（重连后收到 turn_end）：直接添加
                 self.center_panel.add_message(finalized)
+            # 对话结束：后台异步刷新余额（非强制，命中5分钟缓存则零开销）
+            self._query_balance_async(force=False)
 
         elif event_type == "tool_call":
             tool_name = data.get("tool_name", "unknown")
@@ -813,7 +827,15 @@ class MainWindow(QMainWindow):
         tm = ThemeManager()
         tm.load_all()
         current = self.config.theme
-        new_theme = "daylight" if current == "midnight_ocean" else "midnight_ocean"
+        # 循环切换所有已加载主题（与设置面板下拉列表一致）
+        all_keys = list(tm.theme_keys.keys())
+        if not all_keys:
+            return
+        if current in all_keys:
+            idx = all_keys.index(current)
+            new_theme = all_keys[(idx + 1) % len(all_keys)]
+        else:
+            new_theme = all_keys[0]
         theme = tm.set_current(new_theme)
         if theme:
             self.config.theme = new_theme
@@ -835,6 +857,34 @@ class MainWindow(QMainWindow):
         dlg.setWindowTitle("设置")
         dlg.resize(540, 640)
 
+        # 应用当前主题 QSS 到设置对话框，使设置面板跟随主题变色
+        from .theme.theme_manager import ThemeManager
+        tm = ThemeManager()
+        tm.load_all()
+        _theme = tm.current or tm.get_theme(self.config.theme)
+        if _theme:
+            # generate_qss 未覆盖 QDialog 背景，需追加，否则窗口底部仍是系统默认浅色
+            _dlg_qss = tm.generate_qss(_theme) + (
+                f"\nQDialog {{ background-color: {_theme.colors.bg_secondary}; }}"
+                f"\nQDialog QGroupBox {{ background-color: {_theme.colors.bg_card};"
+                f" color: {_theme.colors.text_primary};"
+                f" border: 1px solid {_theme.colors.border}; border-radius: 10px;"
+                f" margin-top: 10px; padding-top: 8px; }}"
+                f"\nQDialog QGroupBox::title {{ subcontrol-origin: margin;"
+                f" color: {_theme.colors.text_primary};"
+                f" left: 12px; padding: 0 6px; }}"
+            )
+            dlg.setStyleSheet(_dlg_qss)
+        # 主题颜色快捷变量（避免内联 setStyleSheet 使用硬编码颜色）
+        _c = _theme.colors if _theme else None
+        CLR_SEC = _c.text_secondary if _c else "#9599A6"
+        CLR_MUTE = _c.text_muted if _c else "#666B75"
+        CLR_BG2 = _c.bg_secondary if _c else "#222427"
+        CLR_WARN = _c.warning if _c else "#D27E24"
+        CLR_ERR = _c.error if _c else "#F65A5A"
+        CLR_OK = _c.success if _c else "#32F08C"
+        CLR_INFO = _c.accent_secondary if _c else "#7BB8FF"
+
         form = QVBoxLayout(dlg)
         form.setContentsMargins(20, 20, 20, 20)
         form.setSpacing(16)
@@ -847,13 +897,13 @@ class MainWindow(QMainWindow):
         endpoint_edit.setPlaceholderText(f"默认：{C.DSH_BASE_URL}")
         conn_layout.addRow("自定义 DSH 端点：", endpoint_edit)
         hint = QLabel("留空则使用默认 http://127.0.0.1:3080。")
-        hint.setStyleSheet("color:#9599A6; font-size:11px;")
+        hint.setStyleSheet(f"color:{CLR_SEC}; font-size:11px;")
         hint.setWordWrap(True)
         conn_layout.addRow(hint)
         form.addWidget(grp_conn)
 
         # 2. API Key
-        grp_key = QGroupBox("DeepSeek API Key")
+        grp_key = QGroupBox("DeepSeek API 密钥")
         key_layout = QFormLayout(grp_key)
         key_layout.setSpacing(10)
         import os, yaml
@@ -870,7 +920,7 @@ class MainWindow(QMainWindow):
         key_edit = QLineEdit(current_key)
         key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         key_edit.setPlaceholderText("sk-...")
-        key_layout.addRow("API Key：", key_edit)
+        key_layout.addRow("API 密钥：", key_edit)
         show_key_cb = QCheckBox("显示明文")
         def toggle_key_visibility(checked: bool):
             key_edit.setEchoMode(
@@ -883,12 +933,12 @@ class MainWindow(QMainWindow):
         verify_row = QHBoxLayout()
         verify_btn = QPushButton("验证 Key")
         verify_status_lbl = QLabel("尚未验证")
-        verify_status_lbl.setStyleSheet("color:#9599A6; font-size:11px;")
+        verify_status_lbl.setStyleSheet(f"color:{CLR_SEC}; font-size:11px;")
         def do_verify():
             key_to_check = key_edit.text().strip()
             if not key_to_check:
                 verify_status_lbl.setText("⚠ 请先输入 Key")
-                verify_status_lbl.setStyleSheet("color:#D27E24; font-size:11px;")
+                verify_status_lbl.setStyleSheet(f"color:{CLR_WARN}; font-size:11px;")
                 return
             # 临时写入 creds 文件，让 DSH 热加载后校验
             try:
@@ -903,10 +953,10 @@ class MainWindow(QMainWindow):
                     _yaml_v.dump(v_data, f, default_flow_style=False, allow_unicode=True)
             except Exception as ev:
                 verify_status_lbl.setText("⚠ 写入失败: %s" % ev)
-                verify_status_lbl.setStyleSheet("color:#F65A5A; font-size:11px;")
+                verify_status_lbl.setStyleSheet(f"color:{CLR_ERR}; font-size:11px;")
                 return
             verify_status_lbl.setText("验证中...")
-            verify_status_lbl.setStyleSheet("color:#387BFF; font-size:11px;")
+            verify_status_lbl.setStyleSheet(f"color:{CLR_INFO}; font-size:11px;")
             QApplication.processEvents()
             try:
                 creds = self.dsh.check_credentials() or {}
@@ -914,16 +964,16 @@ class MainWindow(QMainWindow):
                     provider = creds.get("provider", "")
                     extra = f" ({provider})" if provider else ""
                     verify_status_lbl.setText("✓ Key 有效%s" % extra)
-                    verify_status_lbl.setStyleSheet("color:#32F08C; font-size:11px;")
+                    verify_status_lbl.setStyleSheet(f"color:{CLR_OK}; font-size:11px;")
                 elif creds.get("configured"):
                     verify_status_lbl.setText("⚠ Key 已配置但校验未通过")
-                    verify_status_lbl.setStyleSheet("color:#D27E24; font-size:11px;")
+                    verify_status_lbl.setStyleSheet(f"color:{CLR_WARN}; font-size:11px;")
                 else:
                     verify_status_lbl.setText("⚠ DSH 未识别到 Key")
-                    verify_status_lbl.setStyleSheet("color:#D27E24; font-size:11px;")
+                    verify_status_lbl.setStyleSheet(f"color:{CLR_WARN}; font-size:11px;")
             except Exception as ev:
                 verify_status_lbl.setText("⚠ 验证失败: %s" % ev)
-                verify_status_lbl.setStyleSheet("color:#F65A5A; font-size:11px;")
+                verify_status_lbl.setStyleSheet(f"color:{CLR_ERR}; font-size:11px;")
         verify_btn.clicked.connect(do_verify)
         verify_row.addWidget(verify_btn)
         verify_row.addWidget(verify_status_lbl, stretch=1)
@@ -934,21 +984,19 @@ class MainWindow(QMainWindow):
         key_hint = QLabel(
             f"密钥存储在 {creds_file}\nDSH 会自动热加载，保存后立即生效。"
         )
-        key_hint.setStyleSheet("color:#9599A6; font-size:11px;")
+        key_hint.setStyleSheet(f"color:{CLR_SEC}; font-size:11px;")
         key_hint.setWordWrap(True)
         key_layout.addRow(key_hint)
         form.addWidget(grp_key)
 
-        # 3. 主题
+        # 3. 主题（tm 已在对话框创建时加载，此处复用）
         grp_theme = QGroupBox("主题")
         theme_layout = QFormLayout(grp_theme)
         theme_combo = QComboBox()
-        from .theme.theme_manager import ThemeManager
-        tm = ThemeManager()
-        tm.load_all()
         theme_keys_list: list[str] = []
         for key_name, display_name in tm.theme_keys.items():
-            theme_combo.addItem(display_name, key_name)
+            cn_name = tm.cn_display_name(key_name)
+            theme_combo.addItem(cn_name, key_name)
             theme_keys_list.append(key_name)
             if key_name == self.config.theme:
                 theme_combo.setCurrentIndex(theme_combo.count() - 1)
@@ -1001,13 +1049,13 @@ class MainWindow(QMainWindow):
             "Ctrl+B          切换左栏显示\n"
             "Ctrl+J          切换右栏显示\n"
             "Ctrl+Shift+M    切换 Work / Code 模式\n"
-            "Ctrl+.          切换明/暗主题\n"
+            "Ctrl+.          循环切换主题\n"
             "Ctrl+Enter      发送消息\n"
             "Esc             停止 Agent\n"
             "Ctrl+,          打开设置"
         )
         keys_txt.setStyleSheet(
-            "background-color:#1A1B1D; color:#9599A6; "
+            f"background-color:{CLR_BG2}; color:{CLR_SEC}; "
             "font-family: Consolas, monospace; font-size:11px;"
         )
         keys_layout.addWidget(keys_txt)
@@ -1017,6 +1065,13 @@ class MainWindow(QMainWindow):
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
+        # 中文化按钮文字
+        _save_btn = btns.button(QDialogButtonBox.StandardButton.Save)
+        _cancel_btn = btns.button(QDialogButtonBox.StandardButton.Cancel)
+        if _save_btn:
+            _save_btn.setText("保存")
+        if _cancel_btn:
+            _cancel_btn.setText("取消")
         def accept_all():
             ep = endpoint_edit.text().strip()
             self.config.custom_dsh_endpoint = ep if ep and ep != C.DSH_BASE_URL else ""
@@ -1140,7 +1195,35 @@ class MainWindow(QMainWindow):
     def update_runtime_status(self) -> None:
         def on_balance(result):
             self.status_bar.set_balance(result)
+            # 同时刷新内联小部件的余额
+            QTimer.singleShot(0, lambda: self.center_panel.set_balance(result))
         self.dsh.balance.query_async(on_balance)
+
+    def _query_balance_async(self, force: bool = False) -> None:
+        """后台异步查询余额，结果同时更新状态栏与内联小部件。
+
+        回调在 worker 线程执行，通过 QTimer.singleShot(0, ...) 把 UI 更新
+        投递回主线程（避免跨线程直接操作 Qt widget）。
+        """
+        if self.dsh is None or self.dsh.balance is None:
+            return
+        try:
+            def on_result(result):
+                # 跨线程安全：QTimer.singleShot(0, cb) 把 cb 放到主线程事件队列
+                def apply_ui():
+                    self.status_bar.set_balance(result)
+                    self.center_panel.set_balance(result)
+                QTimer.singleShot(0, apply_ui)
+            self.dsh.balance.query_async(on_result, force=force)
+        except Exception as e:
+            log.warning("触发余额异步查询失败: %s", e)
+
+    def _action_refresh_balance(self) -> None:
+        """用户点击余额小部件触发的强制刷新。"""
+        self.center_panel.set_balance_loading()
+        self.status_bar.show_temporary("🔄 正在刷新余额…", color="#387BFF", duration_ms=1500)
+        # force=True 跳过 5 分钟缓存
+        self._query_balance_async(force=True)
 
     def refresh_models(self) -> None:
         try:

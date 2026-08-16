@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,13 +59,25 @@ class OfflineCache:
 
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or get_offline_db_path()
+        # 持久化单连接 + 全局锁：避免每次操作都新建 sqlite3 连接（连接创建是主要开销）。
+        # OfflineCache 可能被多个线程（WS 事件线程 / UI 线程）调用，故用锁串行化。
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
+        try:
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass
         self._init_db()
 
     def _init_db(self) -> None:
         """初始化数据库表。"""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
-            conn.executescript("""
+        with self._lock:
+            self._conn.executescript("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
                     title TEXT NOT NULL DEFAULT '',
@@ -88,7 +101,7 @@ class OfflineCache:
                 CREATE INDEX IF NOT EXISTS idx_sessions_accessed
                     ON sessions(accessed_at);
             """)
-            conn.commit()
+            self._conn.commit()
 
     def save_turn(
         self,
@@ -112,21 +125,21 @@ class OfflineCache:
         now = time.time()
         metadata = json.dumps({"tool_summary": tool_summary or []}, ensure_ascii=False)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._lock:
             # 写入用户消息
-            conn.execute(
+            self._conn.execute(
                 "INSERT INTO messages (session_id, role, content, timestamp, turn, metadata) "
                 "VALUES (?, 'user', ?, ?, ?, '{}')",
                 (session_id, user_message, now, turn),
             )
             # 写入 Assistant 消息
-            conn.execute(
+            self._conn.execute(
                 "INSERT INTO messages (session_id, role, content, timestamp, turn, metadata) "
                 "VALUES (?, 'assistant', ?, ?, ?, ?)",
                 (session_id, assistant_message, now + 0.001, turn, metadata),
             )
             # 更新会话摘要
-            conn.execute(
+            self._conn.execute(
                 """
                 INSERT INTO sessions (session_id, title, last_message_at, message_count, accessed_at)
                 VALUES (?, ?, ?, 1, ?)
@@ -138,36 +151,35 @@ class OfflineCache:
                 """,
                 (session_id, title, now, now),
             )
-            conn.commit()
+            self._conn.commit()
 
         # LRU 淘汰
         self._evict_if_needed()
 
     def _evict_if_needed(self) -> None:
         """LRU 淘汰：仅保留最近 5000 条消息。"""
-        with sqlite3.connect(self.db_path) as conn:
-            count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-            if count <= C.OFFLINE_CACHE_MAX_MESSAGES:
-                return
-            # 删除最旧的消息
-            excess = count - C.OFFLINE_CACHE_MAX_MESSAGES
-            conn.execute(
-                "DELETE FROM messages WHERE id IN "
-                "(SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?)",
-                (excess,),
-            )
-            # 清理空会话
-            conn.execute(
-                "DELETE FROM sessions WHERE session_id NOT IN "
-                "(SELECT DISTINCT session_id FROM messages)"
-            )
-            conn.commit()
-            log.info("LRU 淘汰 %d 条过期消息", excess)
+        with self._lock:
+            count = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            if count > C.OFFLINE_CACHE_MAX_MESSAGES:
+                # 删除最旧的消息
+                excess = count - C.OFFLINE_CACHE_MAX_MESSAGES
+                self._conn.execute(
+                    "DELETE FROM messages WHERE id IN "
+                    "(SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?)",
+                    (excess,),
+                )
+                # 清理空会话
+                self._conn.execute(
+                    "DELETE FROM sessions WHERE session_id NOT IN "
+                    "(SELECT DISTINCT session_id FROM messages)"
+                )
+                self._conn.commit()
+                log.info("LRU 淘汰 %d 条过期消息", excess)
 
     def list_recent_sessions(self, limit: int = 10) -> list[CachedSession]:
         """列出最近会话（离线模式启动时用）。"""
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
+        with self._lock:
+            rows = self._conn.execute(
                 "SELECT session_id, title, last_message_at, message_count "
                 "FROM sessions ORDER BY last_message_at DESC LIMIT ?",
                 (limit,),
@@ -184,8 +196,8 @@ class OfflineCache:
 
     def get_messages(self, session_id: str, limit: int = 50) -> list[CachedMessage]:
         """获取会话的缓存消息。"""
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
+        with self._lock:
+            rows = self._conn.execute(
                 "SELECT session_id, role, content, timestamp, turn, metadata "
                 "FROM messages WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
                 (session_id, limit),
@@ -204,17 +216,25 @@ class OfflineCache:
 
     def touch_session(self, session_id: str) -> None:
         """更新会话访问时间（LRU 用）。"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
+        with self._lock:
+            self._conn.execute(
                 "UPDATE sessions SET accessed_at = ? WHERE session_id = ?",
                 (time.time(), session_id),
             )
-            conn.commit()
+            self._conn.commit()
 
     def clear_all(self) -> None:
         """清空所有缓存。"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM messages")
-            conn.execute("DELETE FROM sessions")
-            conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM messages")
+            self._conn.execute("DELETE FROM sessions")
+            self._conn.commit()
         log.info("离线缓存已清空")
+
+    def close(self) -> None:
+        """关闭数据库连接（应用退出时调用）。"""
+        with self._lock:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass

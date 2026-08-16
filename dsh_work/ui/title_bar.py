@@ -25,6 +25,40 @@ from PySide6.QtWidgets import (
 from .. import constants as C
 
 
+def _theme_colors():
+    try:
+        from .theme.theme_manager import ThemeManager
+        tm = ThemeManager()
+        theme = tm.current
+        if theme and theme.colors:
+            return theme.colors
+    except Exception:
+        pass
+    return None
+
+
+_FALLBACK = {
+    "bg_secondary": "#0D0D0E",
+    "divider": "#B5BDC5",
+    "input_bg": "#B5BDC5",
+    "input_border": "#B5BDC5",
+    "border": "#B5BDC5",
+}
+
+
+def _palette() -> dict:
+    tc = _theme_colors()
+    if tc:
+        return {
+            "bg_secondary": tc.bg_secondary or _FALLBACK["bg_secondary"],
+            "divider": tc.divider or _FALLBACK["divider"],
+            "input_bg": tc.input_bg or _FALLBACK["input_bg"],
+            "input_border": tc.input_border or _FALLBACK["input_border"],
+            "border": tc.border or _FALLBACK["border"],
+        }
+    return dict(_FALLBACK)
+
+
 class ModeSlider(QWidget):
     """滑块式 Work/Code 切换控件。
 
@@ -45,8 +79,6 @@ class ModeSlider(QWidget):
     # 品牌色
     _WORK_COLOR = "#32F08C"
     _CODE_COLOR = "#7BB8FF"
-    _TRACK_BG = "rgba(224, 226, 242, 0.06)"
-    _TRACK_BORDER = "rgba(224, 226, 242, 0.10)"
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -77,11 +109,15 @@ class ModeSlider(QWidget):
         w = self.width()
         h = self.height()
 
+        p = _palette()
+        track_bg = QColor(p["input_bg"])
+        track_border = QColor(p["border"])
+
         # 1. 绘制胶囊背景
         from PySide6.QtCore import QRectF
         track = QRectF(0, 0, w, h)
-        painter.setBrush(QBrush(QColor(self._TRACK_BG)))
-        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(track_bg))
+        painter.setPen(QPen(track_border))
         painter.drawRoundedRect(track, h / 2, h / 2)
 
         # 2. 绘制滑动指示块（半透明色块）
@@ -172,18 +208,27 @@ class TitleBar(QWidget):
         self.setObjectName("TopBar")
         self.setFixedHeight(40)
         self._setup_ui()
+        self.apply_theme()
 
-    def _setup_ui(self) -> None:
+        try:
+            from .theme.theme_manager import ThemeManager
+            ThemeManager().add_listener(self.apply_theme)
+        except Exception:
+            pass
+
+    def apply_theme(self, theme=None) -> None:
+        """刷新样式表为当前主题配色。"""
+        p = _palette()
         self.setStyleSheet(
             "QWidget#TopBar {"
-            "  background-color: #0D0D0E;"
-            "  border-bottom: 1px solid rgba(224, 226, 242, 0.06);"
+            f"  background-color: {p['bg_secondary']};"
+            f"  border-bottom: 1px solid {p['divider']};"
             "}"
         )
         combo_style = (
             "QComboBox {"
-            "  background-color: rgba(224, 226, 242, 0.05);"
-            "  border: 1px solid rgba(224, 226, 242, 0.08);"
+            f"  background-color: {p['input_bg']};"
+            f"  border: 1px solid {p['input_border']};"
             "  border-radius: 6px;"
             "  padding: 4px 8px;"
             "  font-size: 12px;"
@@ -196,6 +241,12 @@ class TitleBar(QWidget):
             "  selection-background-color: rgba(120, 119, 198, 0.2);"
             "}"
         )
+        if getattr(self, "_preset_combo", None) is not None:
+            self._preset_combo.setStyleSheet(combo_style)
+        if getattr(self, "_model_combo", None) is not None:
+            self._model_combo.setStyleSheet(combo_style)
+
+    def _setup_ui(self) -> None:
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 8, 0)
@@ -216,7 +267,6 @@ class TitleBar(QWidget):
         for pid, pname in TitleBar.PRESETS:
             self._preset_combo.addItem(pname, pid)
         self._preset_combo.currentIndexChanged.connect(self._on_preset_index_changed)
-        self._preset_combo.setStyleSheet(combo_style)
         layout.addWidget(self._preset_combo)
 
         # 右侧：模型选择器
@@ -224,7 +274,6 @@ class TitleBar(QWidget):
         self._model_combo.setMinimumWidth(180)
         self._model_combo.setPlaceholderText("选择模型")
         self._model_combo.currentTextChanged.connect(self.model_changed)
-        self._model_combo.setStyleSheet(combo_style)
         layout.addWidget(self._model_combo)
 
         layout.addStretch()

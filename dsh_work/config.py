@@ -128,6 +128,22 @@ class UserConfig:
     # 上次使用的场景（首次启动引导用）
     last_scenario: str = ""
 
+    # ===== 外置视觉模型（inspect_image 工具）=====
+    # OpenAI 兼容视觉端点（支持 qwen-vl / GLM-4V / Ollama / 任意 OpenAI Chat Completions 兼容服务）
+    # 示例：
+    #   通义千问 VL: https://dashscope.aliyuncs.com/compatible-mode/v1
+    #   智谱 GLM-4V: https://open.bigmodel.cn/api/paas/v4
+    #   Ollama (本地): http://127.0.0.1:11434/v1
+    vision_api_base: str = ""
+    # 视觉端点 API Key（Ollama 本地可留空）
+    vision_api_key: str = ""
+    # 使用的视觉模型名（如 qwen-vl-max / glm-4v-flash / llava:7b）
+    vision_model: str = ""
+    # 单张图片最大分辨率（长边像素，超出时客户端侧下采样后再上传，省 token）
+    vision_max_image_size: int = 1024
+    # 视觉工具默认提示词（留空时使用参数传入的 prompt）
+    vision_default_prompt: str = "请详细描述这张图片的内容，包括文字、物体、场景、颜色等所有可见信息。"
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
