@@ -72,7 +72,7 @@ Write-Step "Inno Setup 编译安装包"
 & $iscc "installer\dsh-work.iss"
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败 (rc=$LASTEXITCODE)" }
 
-$setup = Join-Path $root "installer\Output\DSHWork-Setup-0.1.0.exe"
+$setup = Join-Path $root "installer\Output\DSHWork-Setup-0.3.0.exe"
 if (Test-Path $setup) {
     Write-Host "安装包产出: $setup ($([math]::Round((Get-Item $setup).Length/1MB,1)) MB)" -ForegroundColor Green
 }

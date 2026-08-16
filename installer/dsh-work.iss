@@ -15,7 +15,7 @@
 ; - 仅 64 位（PySide6 + 便携 Node 均为 x64）
 
 #define MyAppName "DSH Work"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "DSH Work"
 #define MyAppExeName "DSHWork.exe"
 #define MyAppURL "https://github.com/deepseek-ai/deepseek-harness"
@@ -47,7 +47,9 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 ; SetupIconFile=installer\icons\app.ico   ; 暂无图标，补充后取消注释
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 注：官方 Inno Setup 6 内置语言不含简体中文（ChineseSimplified.isl 为第三方语言包）。
+; 如需中文安装向导，请从 https://jrsoftware.org/files/istrans/ 下载后取消下行注释。
+; Name: "chinesesimp"; MessagesFile: "compiler:Languages\Unofficial\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
