@@ -10,13 +10,16 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 from .. import constants as C
 # 直接从子模块导入，避免走 api/__init__.py → dsh_service → core/__init__.py 的循环链路
 from ..api.dsh_service import DshService, MessageRecord, SessionInfo
 from ..api.ws_client import WSMessage, WSEventType
 from ..utils.logger import get_logger
+
+if TYPE_CHECKING:
+    WSEventMessage = WSMessage
 
 log = get_logger("core.session_manager")
 
@@ -149,6 +152,155 @@ class SessionManager:
         self._chunk_timers: dict[str, threading.Timer] = {}
         self._chunk_lock = threading.Lock()
 
+        # ===== 兜底轮询：RUNNING 状态下如果 WebSocket 丢失事件，定期 get_history 拉取 =====
+        # 启动阈值：状态进入 RUNNING/THINKING/TOOL_EXECUTING 后若 X 秒无任何通知，启动轮询
+        self._poll_interval = 5.0     # 轮询间隔（秒），5 秒一次，足够轻量
+        self._poll_timeout = 120.0    # 最大轮询时长（2 分钟），超时自动标记 IDLE
+        self._poll_lock = threading.Lock()
+        self._poll_thread: threading.Thread | None = None
+        self._poll_stop = threading.Event()
+        # session_id -> sent_epoch（该 session 何时进入 RUNNING，用于 2 分钟超时判定）
+        self._poll_running_since: dict[str, float] = {}
+
+    def _ensure_poll_running(self) -> None:
+        """启动兜底轮询线程（只启动一次）。"""
+        with self._poll_lock:
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                return
+            self._poll_stop.clear()
+            self._poll_thread = threading.Thread(
+                target=self._poll_loop, daemon=True, name="session-man-poll",
+            )
+            self._poll_thread.start()
+
+    def _stop_poll(self) -> None:
+        with self._poll_lock:
+            if self._poll_thread is not None:
+                self._poll_stop.set()
+                t = self._poll_thread
+                self._poll_thread = None
+            else:
+                t = None
+        if t is not None:
+            try:
+                t.join(timeout=3)
+            except Exception:
+                pass
+
+    def _mark_session_poll_start(self, session_id: str) -> None:
+        """标记一个会话进入需要轮询的状态。"""
+        self._poll_running_since[session_id] = time.time()
+        self._ensure_poll_running()
+
+    def _mark_session_poll_end(self, session_id: str) -> None:
+        """标记会话结束（恢复 IDLE），停止对该会话的轮询。"""
+        self._poll_running_since.pop(session_id, None)
+
+    def _poll_loop(self) -> None:
+        """轮询主循环：扫描所有进入 RUNNING 的会话，get_history 合并，直到都结束。"""
+        import time as _t
+        while not self._poll_stop.is_set():
+            if not self._poll_running_since:
+                # 没有需要轮询的会话：直接退出，下次 send_message 再重启
+                with self._poll_lock:
+                    if not self._poll_running_since:
+                        self._poll_thread = None
+                        return
+            # 快照需要轮询的会话（避免迭代期间修改）
+            pending = list(self._poll_running_since.keys())
+            now = _t.time()
+            for sid in pending:
+                started_at = self._poll_running_since.get(sid)
+                if started_at is None:
+                    continue
+                # 超过 2 分钟无结果：强制标记 IDLE，避免永久轮询
+                if now - started_at > self._poll_timeout:
+                    state = self._sessions.get(sid)
+                    if state and state.agent_status != AgentStatus.IDLE:
+                        log.warning("轮询超时 session=%s，强制 IDLE", sid)
+                        state.agent_status = AgentStatus.IDLE
+                        state.last_event_type = "error"
+                        state.last_event_data = {
+                            "message": "Agent 响应超时（> 2 分钟无事件），请检查网络或重试",
+                            "error": "poll_timeout",
+                        }
+                        state.streaming_buffer = ""
+                        self._mark_session_poll_end(sid)
+                        self._notify(sid)
+                    continue
+                try:
+                    self._poll_once(sid)
+                except Exception as e:
+                    log.debug("轮询 session=%s 异常: %s", sid, e)
+            # 等待一轮，允许中途被 stop 打断
+            if self._poll_stop.wait(self._poll_interval):
+                return
+
+    def _poll_once(self, session_id: str) -> None:
+        """单次轮询：拉取历史，合并新消息，检测是否出现 assistant 结尾（TURN 完成）。"""
+        state = self._sessions.get(session_id)
+        if state is None:
+            self._mark_session_poll_end(session_id)
+            return
+        # 如果 WebSocket 已经让它恢复到 IDLE，停止轮询
+        if state.agent_status == AgentStatus.IDLE:
+            self._mark_session_poll_end(session_id)
+            return
+        hist = self.dsh.get_history(session_id) or []
+        if not hist:
+            return
+
+        # ---- 二次检查：get_history() 期间 WebSocket 可能已处理完 TURN_END ----
+        # 如果 agent 已恢复 IDLE，轮询不再处理，避免与 WebSocket 重复添加消息。
+        if state.agent_status == AgentStatus.IDLE:
+            self._mark_session_poll_end(session_id)
+            return
+
+        # 去重合并
+        added = self._append_messages(state, hist)
+        state.messages.sort(key=lambda m: m.timestamp)
+
+        # 检测 turn 是否结束：最后一条非空 assistant 消息是否存在
+        ended = False
+        finalized: MessageRecord | None = None
+        for m in reversed(hist):
+            if getattr(m, "role", None) == "assistant" and getattr(m, "content", ""):
+                finalized = m
+                break
+        if finalized is not None:
+            # 内容级去重（不依赖时间戳）：防止 WebSocket TURN_END 已添加的消息被轮询重复添加
+            already_has = any(
+                sm.role == "assistant" and sm.content == finalized.content
+                for sm in state.messages
+            )
+            if not already_has:
+                added.append(finalized)
+                state.messages.append(finalized)
+                state._msg_ts_index.add(finalized.timestamp)
+            # 判定：DSH 侧已经产生了 assistant 消息，我们视为本轮有效结束
+            # （即便 streaming_buffer 未累积到该内容），把它写入 UI，避免 WebSocket 全丢
+            if state.streaming_buffer and finalized.content.startswith(state.streaming_buffer):
+                # WS 收到了一部分，剩下的在历史里：补齐
+                state.streaming_buffer = finalized.content
+            elif not state.streaming_buffer:
+                state.streaming_buffer = finalized.content
+            # 标记 ended → 触发一次 turn_end 事件
+            ended = True
+
+        if added or ended:
+            state.last_event_type = "history_sync" if not ended else "turn_end"
+            if ended:
+                # turn_end：固化 streaming 缓冲 + 切 IDLE
+                if state.streaming_buffer:
+                    # 已经加过 finalized，这里避免重复追加
+                    state.streaming_buffer = ""
+                state.agent_status = AgentStatus.IDLE
+                self._mark_session_poll_end(session_id)
+                state.last_event_data = {"message": finalized}
+            else:
+                state.last_event_data = {"added": len(added)}
+            self._notify(session_id)
+
     # ===== 消息时间戳索引辅助（保持 set 与 list 同步）=====
 
     def _rebuild_ts_index(self, state: SessionState) -> None:
@@ -218,6 +370,12 @@ class SessionManager:
     def sessions(self) -> dict[str, SessionState]:
         return self._sessions
 
+    def _get_state(self, session_id: str) -> SessionState | None:
+        """获取指定会话的运行时状态。"""
+        if not session_id:
+            return None
+        return self._sessions.get(session_id)
+
     def add_listener(self, listener: Callable[[str, SessionState], None]) -> None:
         """注册会话状态变更监听器。"""
         self._listeners.append(listener)
@@ -225,6 +383,10 @@ class SessionManager:
     def _notify(self, session_id: str) -> None:
         state = self._sessions.get(session_id)
         if state:
+            event_type = getattr(state, "last_event_type", "")
+            log.info("[DEBUG] _notify: session=%s event_type=%s agent_status=%s listeners=%d",
+                     session_id, event_type, state.agent_status.value if hasattr(state.agent_status, 'value') else state.agent_status,
+                     len(self._listeners))
             for listener in list(self._listeners):
                 try:
                     listener(session_id, state)
@@ -244,12 +406,19 @@ class SessionManager:
             self._chunk_pending[session_id] = False
             self._notify(session_id)
 
+            # 捕获当前 event_type/event_data 快照，供 _flush 使用
+            # 避免 _flush 在 TURN_END 之后运行时读到错误的 state.last_event_type
+            state = self._sessions.get(session_id)
+            _snap_type = state.last_event_type if state else "chunk"
+            _snap_data = dict(state.last_event_data) if state else {}
+
             def _flush():
                 with self._chunk_lock:
                     self._chunk_timers.pop(session_id, None)
                     pending = self._chunk_pending.pop(session_id, False)
                 if pending:
-                    self._notify(session_id)
+                    # 使用捕获的快照，避免 TURN_END 已经修改了 state.last_event_type
+                    self._notify_with(session_id, _snap_type, _snap_data)
 
             t = threading.Timer(_CHUNK_NOTIFY_INTERVAL_MS / 1000.0, _flush)
             t.daemon = True
@@ -265,6 +434,18 @@ class SessionManager:
             pending = self._chunk_pending.pop(session_id, False)
         if pending:
             self._notify(session_id)
+
+    def _notify_with(self, session_id: str, event_type: str, event_data: dict) -> None:
+        """使用指定的 event_type/event_data 通知监听器（避免从共享 state 读取竞态数据）。"""
+        state = self._sessions.get(session_id)
+        if state:
+            log.info("[DEBUG] _notify_with: session=%s event_type=%s data_keys=%s listeners=%d",
+                     session_id, event_type, list(event_data.keys()), len(self._listeners))
+            for listener in list(self._listeners):
+                try:
+                    listener(session_id, event_type, event_data)
+                except Exception as e:
+                    log.error("会话监听器异常: %s", e)
 
     # ===== 会话管理 =====
 
@@ -305,7 +486,21 @@ class SessionManager:
             self.switch_to(info.id)
             return state
         except Exception as e:
-            log.warning("通过 DSH 创建会话失败，降级为本地草稿会话: %s", e)
+            err_msg = str(e)
+            # 工作区不存在是常见问题（DSH 版本兼容性），尝试无 workspace 重试
+            if workspace and "workspace" in err_msg.lower() and "not found" in err_msg.lower():
+                log.warning("工作区不被 DSH 识别，尝试无 workspace 重试: %s", e)
+                try:
+                    info = self.dsh.create_session(title=title, model=model,
+                                                    workspace="", agent_preset=agent_preset)
+                    state = SessionState(info=info)
+                    self._sessions[info.id] = state
+                    self.switch_to(info.id)
+                    return state
+                except Exception as e2:
+                    log.warning("无 workspace 重试仍然失败，降级为本地草稿会话: %s", e2)
+            else:
+                log.warning("通过 DSH 创建会话失败，降级为本地草稿会话: %s", e)
 
         # 2. 回退：本地草稿会话（DSH 不可用时，保证 ＋ 按钮永远有反应）
         now = time.time()
@@ -439,6 +634,8 @@ class SessionManager:
             # 空闲：发送新消息
             state.agent_status = AgentStatus.RUNNING
             state.current_turn += 1
+            # 启动兜底轮询：防止 WebSocket 丢事件导致 UI 永不刷新
+            self._mark_session_poll_start(self._current_session_id)
             try:
                 self.dsh.send_message(self._current_session_id, content, attachments)
                 self._last_send_ok = True
@@ -446,6 +643,7 @@ class SessionManager:
                 log.error("发送消息失败: %s", e)
                 rpc_error = e
                 state.agent_status = AgentStatus.ERROR
+                self._mark_session_poll_end(self._current_session_id)
 
         # ---- 失败回滚：移除乐观添加的消息 ----
         if not self._last_send_ok:
@@ -455,6 +653,7 @@ class SessionManager:
                 state._msg_ts_index.discard(popped.timestamp)   # 同步索引回滚
             if state.agent_status == AgentStatus.RUNNING:
                 state.agent_status = AgentStatus.IDLE
+                self._mark_session_poll_end(self._current_session_id)
                 if state.current_turn > 0:
                     state.current_turn -= 1
             # 将原始异常携带到状态上，供 UI 层读取提示
@@ -463,15 +662,45 @@ class SessionManager:
         self._notify(self._current_session_id)
 
     def cancel_agent(self) -> None:
-        """停止 Agent 执行。"""
+        """停止 Agent 执行。
+
+        如果正在流式输出，立即固化当前缓冲区为最终消息，
+        避免轮询和 WebSocket 重复输出导致同一个回答出现多次。
+        """
         if not self._current_session_id:
             return
         try:
             self.dsh.cancel_session(self._current_session_id)
             state = self.current_session
-            if state:
-                state.agent_status = AgentStatus.IDLE
-                self._notify(self._current_session_id)
+            if not state:
+                return
+
+            state.agent_status = AgentStatus.IDLE
+            state.last_event_type = "turn_end"
+
+            # 如果正在流式输出且有内容，立即固化为最终消息
+            # （DSH 端已生成完整回答，避免轮询和 WebSocket 重复添加）
+            if state.streaming_buffer:
+                finalized_msg = MessageRecord(
+                    role="assistant",
+                    content=state.streaming_buffer,
+                    timestamp=time.time(),
+                )
+                state.messages.append(finalized_msg)
+                state._msg_ts_index.add(finalized_msg.timestamp)
+                state.last_event_data = {"message": finalized_msg}
+                state.streaming_buffer = ""
+                log.info("停止 Agent：流式缓冲区已固化为一条消息 (%d 字符)", len(finalized_msg.content))
+            else:
+                state.last_event_data = {}
+
+            # 停止轮询（不再拉取历史，避免重复添加）
+            self._mark_session_poll_end(self._current_session_id)
+
+            # 清理 chunk 定时器
+            self._cancel_chunk_timer(self._current_session_id)
+
+            self._notify(self._current_session_id)
         except Exception as e:
             log.error("停止 Agent 失败: %s", e)
 
@@ -562,33 +791,59 @@ class SessionManager:
                 log.info("会话已删除: %s", sid)
 
     def _handle_session_event(self, msg: WSMessage) -> None:
-        """处理当前会话的事件流。"""
-        state = self.current_session
+        """处理当前会话的事件流。
+
+        注意：必须用 msg.session_id 取 state，不能用 self.current_session，
+        否则兜底轮询把 A 会话的 finalized 写入时，若 B 会话是当前选中，
+        B 会话的 UI 会显示 A 的回复，造成"第二对话返回第一回答"现象。
+        """
+        state = self._get_state(msg.session_id)
         if not state:
             return
 
         if msg.event_type == WSEventType.CHUNK:
+            # 取消后防护：如果 Agent 已被用户停止（IDLE），忽略残留的 CHUNK 事件
+            if state.agent_status == AgentStatus.IDLE:
+                return
+
             # 流式文本块：追加到 streaming_buffer
-            chunk = msg.data.get("content") or msg.data.get("text", "")
-            state.streaming_buffer += chunk
+            # msg.data 结构: {'turn': N, 'step': N, 'chunk': {'type': 'text-delta', 'index': N, 'text': '内容'}}
+            # 只从 text-delta 类型提取文本（block-end 包含完整文本，会和 text-delta 重复）
+            chunk_text = ""
+            chunk_data = msg.data.get("chunk", {})
+            if isinstance(chunk_data, dict) and chunk_data.get("type") == "text-delta":
+                chunk_text = chunk_data.get("text", "")
+            chunk_text = str(chunk_text) if chunk_text else ""
+            state.streaming_buffer += chunk_text
             state.agent_status = AgentStatus.THINKING
             state.last_event_type = "chunk"
-            state.last_event_data = {"chunk": chunk}
+            state.last_event_data = {"chunk": chunk_text}
             # 优化：CHUNK 节流，30ms 合并一次 UI 刷新（避免每个小 chunk 都重绘）
             self._notify_chunk(msg.session_id)
 
         elif msg.event_type == WSEventType.TURN_START:
+            # 取消后防护：如果 Agent 已被用户停止，忽略新的 TURN_START
+            if state.agent_status == AgentStatus.IDLE:
+                return
             state.agent_status = AgentStatus.RUNNING
             state.current_turn = msg.data.get("turn", state.current_turn + 1)
             state.streaming_buffer = ""
             state.last_event_type = "turn_start"
             state.last_event_data = {}
+            # 启动兜底轮询（防止 WebSocket 后续 chunk/turn_end 全丢）
+            self._mark_session_poll_start(msg.session_id)
             self._cancel_chunk_timer(msg.session_id)   # 清理旧定时器
             self._notify(msg.session_id)
 
         elif msg.event_type == WSEventType.TURN_END or msg.event_type == WSEventType.DONE:
+            # 取消后防护：如果 Agent 已被用户停止且流式缓冲区已清空，忽略重复的 TURN_END
+            if state.agent_status == AgentStatus.IDLE and not state.streaming_buffer:
+                return
+
             # 一轮对话结束：先 flush 掉 CHUNK 节流，确保最后一块立即送达
             self._cancel_chunk_timer(msg.session_id)
+            # 停止兜底轮询
+            self._mark_session_poll_end(msg.session_id)
             # 一轮对话结束：将 streaming_buffer 固化为消息
             finalized_msg = None
             if state.streaming_buffer:

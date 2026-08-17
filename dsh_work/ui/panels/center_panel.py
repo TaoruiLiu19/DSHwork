@@ -1,7 +1,28 @@
 """中栏：对话/工作区主区域（第 3.3 节）。
 
-由四部分组成：消息流、余额内联小部件、输入框、工具调用内联展示。
-两种模式共享的核心区域，差异在于信息密度和呈现方式。
+参考 DSH Desktop 官方设计：
+- 消息流占据主要区域，工具调用卡片内联嵌入
+- 余额小部件在消息流和输入框之间
+- 输入框固定在底部
+
+布局结构（简化）：
+┌──────────────────────────────────────┐
+│  ┌────────────────────────────────┐  │
+│  │      消息流（MessageList）      │  │
+│  │  - 用户消息（右对齐，主题色）   │  │
+│  │  - Assistant 消息（左对齐）     │  │
+│  │  - 工具调用卡片（内联折叠）     │  │
+│  │  - 空状态快捷入口卡片           │  │
+│  └────────────────────────────────┘  │
+│  ┌────────────────────────────────┐  │
+│  │      余额内联小部件            │  │
+│  └────────────────────────────────┘  │
+│  ┌────────────────────────────────┐  │
+│  │      输入框（InputBox）         │  │
+│  │  - 模式切换（工作/代码）        │  │
+│  │  - 多行文本输入 + 发送按钮      │  │
+│  └────────────────────────────────┘  │
+└──────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -15,7 +36,6 @@ from ...core.session_manager import AgentStatus, ContextUsage
 from ..widgets.message_list import MessageList
 from ..widgets.input_box import InputBox
 from ..widgets.empty_state_cards import EmptyStateCards
-from ..widgets.tool_call_card import ToolCallAggregator, ToolCallCard
 from ..widgets.balance_widget import BalanceWidget
 from ... import constants as C
 
@@ -24,11 +44,13 @@ class CenterPanel(QWidget):
     """中栏：对话区域 + 余额小部件 + 输入框。
 
     空状态时显示快捷入口卡片，有消息时显示消息流。
+    工具调用由 MessageList 内部管理，不再由本类中转。
     """
 
     send_requested = Signal(str)
     stop_requested = Signal()
     files_dropped = Signal(list)
+    mode_changed = Signal(str)  # 工作/代码模式切换
     card_clicked = Signal(str, str)  # prompt, mode
     scrolled_to_top = Signal()
     balance_refresh_requested = Signal()  # 用户点击余额小部件触发强制刷新
@@ -40,11 +62,15 @@ class CenterPanel(QWidget):
         self._show_empty_state()
 
     def _setup_ui(self) -> None:
+        """初始化 UI 组件。
+
+        布局：QStackedWidget（空状态/消息流）→ 余额小部件 → 输入框
+        """
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 堆叠：空状态 / 消息流
+        # ===== 堆叠：空状态 / 消息流 =====
         self._stack = QStackedWidget()
 
         # 空状态快捷卡片
@@ -52,41 +78,31 @@ class CenterPanel(QWidget):
         self._empty_state.card_clicked.connect(self.card_clicked)
         self._empty_index = self._stack.addWidget(self._empty_state)
 
-        # 消息流
+        # 消息流（已集成工具调用聚合器管理）
         self._message_list = MessageList()
         self._message_list.scrolled_to_top.connect(self.scrolled_to_top)
         self._messages_index = self._stack.addWidget(self._message_list)
 
         layout.addWidget(self._stack, stretch=1)
 
-        # 余额内联小部件（消息列表与输入框之间）
+        # ===== 余额内联小部件（消息列表与输入框之间） =====
         self._balance_widget = BalanceWidget()
         self._balance_widget.refresh_requested.connect(self.balance_refresh_requested)
         layout.addWidget(self._balance_widget)
 
-        # 输入框
+        # ===== 输入框 =====
         self._input_box = InputBox()
         self._input_box.send_requested.connect(self.send_requested)
         self._input_box.stop_requested.connect(self.stop_requested)
         self._input_box.files_dropped.connect(self.files_dropped)
+        self._input_box.mode_changed.connect(self.mode_changed)
         layout.addWidget(self._input_box)
-
-        # 工具调用聚合器
-        self._tool_aggregator = ToolCallAggregator()
-        self._tool_aggregator.set_create_callback(self._insert_tool_card)
 
     def _show_empty_state(self) -> None:
         self._stack.setCurrentIndex(self._empty_index)
 
     def _show_messages(self) -> None:
         self._stack.setCurrentIndex(self._messages_index)
-
-    def _insert_tool_card(self, card: ToolCallCard) -> None:
-        """将工具调用卡片插入消息流。"""
-        self._show_messages()
-        # 插入到消息流末尾（stretch 之前）
-        layout = self._message_list._layout
-        layout.insertWidget(layout.count() - 1, card)
 
     # ===== 消息管理 =====
 
@@ -114,10 +130,8 @@ class CenterPanel(QWidget):
 
     def load_history(self, messages: list) -> None:
         """批量加载历史消息（切换会话时使用，清空后一次性渲染）。"""
-        self._message_list.clear()
         self._show_messages()
-        for msg in messages:
-            self._message_list.add_message(msg)
+        self._message_list.load_messages_batch(messages)
 
     def show_hint(self, title: str, body: str = "") -> None:
         """在空状态顶部插入一条提示条（离线草稿/降级信息等）。
@@ -126,8 +140,7 @@ class CenterPanel(QWidget):
         提示条以一次性卡片形式插入到空状态 widget 顶部；不持久化到 _message_list。
         """
         from PySide6.QtCore import Qt
-        from PySide6.QtGui import QColor, QFont
-        from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QLabel
+        from PySide6.QtWidgets import QFrame, QVBoxLayout, QLabel
 
         existing: QFrame | None = getattr(self._empty_state, "_banner", None)
         if existing is not None:
@@ -164,13 +177,16 @@ class CenterPanel(QWidget):
         self._empty_state._banner = banner
         self._show_empty_state()
 
-    # ===== 工具调用 =====
+    # ===== 工具调用（由内部 MessageList 管理） =====
 
     def on_tool_call(self, tool_name: str, params: dict) -> None:
-        self._tool_aggregator.on_tool_call(tool_name, params)
+        """工具调用事件：由 MessageList 内部管理。"""
+        self._show_messages()
+        self._message_list.on_tool_call(tool_name, params)
 
     def on_tool_result(self, tool_name: str, status: str, result=None, error: str = "") -> None:
-        self._tool_aggregator.on_tool_result(tool_name, status, result, error)
+        """工具结果事件：由 MessageList 内部管理。"""
+        self._message_list.on_tool_result(tool_name, status, result, error)
 
     # ===== 输入框 =====
 

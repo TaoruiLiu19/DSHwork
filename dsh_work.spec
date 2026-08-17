@@ -90,33 +90,13 @@ _console = os.environ.get("DSHWORK_DEBUG_CONSOLE") == "1"
 # ========== onefile 版：单个 exe，把 binaries/datas/scripts/pyz 全打包进去 ==========
 # 注意 onefile 的 EXE 第二个参数必须是 pyz + a.scripts + a.binaries + a.datas + a.zipfiles
 # 拼接的完整列表；exclude_binaries 不能用（否则 binaries 会被排除）。
-# exe = EXE(
-#     pyz,
-#     a.scripts,
-#     a.binaries,
-#     a.datas,
-#     a.zipfiles,
-#     [],
-#     name="DSHWork",
-#     debug=False,
-#     bootloader_ignore_signals=False,
-#     strip=False,
-#     upx=False,
-#     console=_console,
-#     disable_windowed_traceback=False,
-#     argv_emulation=False,
-#     target_arch=None,
-#     codesign_identity=None,
-#     entitlements_file=None,
-#     # icon="resources/icons/app.ico",   # 暂无图标，后续可加
-# )
-
-# ========== onedir 版：产出 dist\DSHWork\（用于 Inno Setup 安装程序打包）==========
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
+    a.zipfiles,
     [],
-    exclude_binaries=True,
     name="DSHWork",
     debug=False,
     bootloader_ignore_signals=False,
@@ -131,11 +111,31 @@ exe = EXE(
     # icon="resources/icons/app.ico",   # 暂无图标，后续可加
 )
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    name="DSHWork",
-)
+# ========== onedir 版：产出 dist\DSHWork\（用于 Inno Setup 安装程序打包）==========
+# exe = EXE(
+#     pyz,
+#     a.scripts,
+#     [],
+#     exclude_binaries=True,
+#     name="DSHWork",
+#     debug=False,
+#     bootloader_ignore_signals=False,
+#     strip=False,
+#     upx=False,
+#     console=_console,
+#     disable_windowed_traceback=False,
+#     argv_emulation=False,
+#     target_arch=None,
+#     codesign_identity=None,
+#     entitlements_file=None,
+#     # icon="resources/icons/app.ico",   # 暂无图标，后续可加
+# )
+
+# coll = COLLECT(
+#     exe,
+#     a.binaries,
+#     a.datas,
+#     strip=False,
+#     upx=False,
+#     name="DSHWork",
+# )

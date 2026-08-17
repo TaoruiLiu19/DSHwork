@@ -206,6 +206,9 @@ class ThemeManager:
         self._preview_viewport_count = C.THEME_PREVIEW_VIEWPORT_LIMIT
         self._settle_pending = False
 
+        # QSS 缓存（key_name → QSS 字符串），避免每次切换主题都重新生成
+        self._qss_cache: dict[str, str] = {}
+
     @staticmethod
     def _to_key_name(display_name: str) -> str:
         """将 display_name 转成 snake_case key 名。"""
@@ -235,6 +238,7 @@ class ThemeManager:
         """加载所有主题（内置 + 用户自定义）。"""
         self._themes.clear()
         self._key_to_name.clear()
+        self._qss_cache.clear()  # 主题重载时清空 QSS 缓存
 
         # 加载内置主题（先注册固定 key 映射）
         for k, n in self.BUILTIN_KEY_TO_NAME.items():
@@ -311,11 +315,7 @@ class ThemeManager:
                 return None
         persist_key, theme = resolved
         self._current = theme
-        # 持久化到用户配置（统一使用 key_name）
-        cfg = UserConfig.load()
-        cfg.theme = persist_key
-        cfg.save()
-        # 通知监听器
+        # 通知监听器（配置持久化由调用方负责，避免双重保存）
         for listener in list(self._listeners):
             try:
                 listener(theme)
@@ -343,13 +343,23 @@ class ThemeManager:
           - btn_border : QPushButton 默认边框
           - input_border: QTextEdit / QPlainTextEdit / QComboBox / QListWidget / QTreeWidget
           - border     : ToolTip / MessageBubble / InlinePreview / Splitter / ScrollBar 等
+
+        性能优化：返回结果会被 set_current 缓存到 _qss_cache 中，
+        后续切换同一主题时直接返回缓存，避免重复生成。
         """
         t = theme or self._current
         if not t:
             return ""
+
+        # 检查缓存（按 key_name 缓存）
+        key_name = self._to_key_name(t.name)
+        cached = self._qss_cache.get(key_name)
+        if cached is not None:
+            return cached
+
         c = t.colors
         radius = t.effects.bubble_radius
-        return f"""
+        qss = f"""
         QWidget#MainWindow {{
             background-color: {c.bg_primary};
         }}
@@ -371,6 +381,15 @@ class ThemeManager:
         }}
         QWidget#CenterPanel {{
             background-color: {c.bg_primary};
+        }}
+        QScrollArea {{
+            background: transparent;
+        }}
+        QScrollArea > QWidget > QWidget {{
+            background: transparent;
+        }}
+        QWidget#MessageListContainer {{
+            background: transparent;
         }}
         QLabel {{
             color: {c.text_primary};
@@ -409,6 +428,8 @@ class ThemeManager:
             border: none;
             border-radius: 12px;
             padding: 4px 16px;
+            font-size: 12px;
+            font-weight: 600;
         }}
         QPushButton#ModeCode {{
             background-color: #7BB8FF;
@@ -416,6 +437,57 @@ class ThemeManager:
             border: none;
             border-radius: 12px;
             padding: 4px 16px;
+            font-size: 12px;
+            font-weight: 600;
+        }}
+        QPushButton#ModeInactive {{
+            background-color: transparent;
+            color: {c.text_muted};
+            border: 1px solid {c.btn_border};
+            border-radius: 12px;
+            padding: 4px 16px;
+            font-size: 12px;
+        }}
+        QPushButton#ModeInactive:hover {{
+            background-color: {c.bg_hover};
+            color: {c.text_primary};
+        }}
+        QPushButton#Danger {{
+            background-color: {c.error};
+            color: #FFFFFF;
+            border: none;
+            border-radius: 6px;
+        }}
+        QPushButton#Danger:hover {{
+            background-color: #E04848;
+        }}
+        QPushButton#InputActionBtn {{
+            background-color: transparent;
+            color: {c.text_muted};
+            border: none;
+            border-radius: 4px;
+        }}
+        QPushButton#InputActionBtn:hover {{
+            background-color: {c.bg_hover};
+            color: {c.text_primary};
+        }}
+        QFrame#InputContainer {{
+            background-color: {c.bg_secondary};
+            border: 1px solid {c.input_border};
+            border-radius: 12px;
+        }}
+        QFrame#InputContainer:focus-within {{
+            border-color: {c.accent};
+        }}
+        QFrame#InputSeparator {{
+            background-color: {c.divider};
+        }}
+        QLabel#DropIndicator {{
+            background-color: {c.bg_card};
+            color: {c.text_muted};
+            border: 2px dashed {c.accent};
+            border-radius: 8px;
+            font-size: 13px;
         }}
         QTextEdit, QPlainTextEdit {{
             background-color: {c.input_bg};
@@ -572,7 +644,16 @@ class ThemeManager:
             border: 1px solid {c.input_border};
             border-radius: 6px;
         }}
+        QMessageBox {{
+            background-color: {c.bg_secondary};
+        }}
+        QMessageBox QLabel {{
+            color: {c.text_primary};
+        }}
         """
+        # 缓存生成的 QSS，下次切换同一主题时直接返回
+        self._qss_cache[key_name] = qss
+        return qss
 
     def export_theme(self, theme: Theme, path: Path) -> None:
         """导出主题为 JSON 文件（主题分享用）。"""

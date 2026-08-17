@@ -26,7 +26,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QTimer
+import json
+import time
+from pathlib import Path
+
+from PySide6.QtCore import Qt, Signal, QTimer, QObject
 from PySide6.QtGui import QKeySequence, QShortcut, QCloseEvent
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -56,6 +60,42 @@ from .widgets.activity_bar import ActivityBar
 log = get_logger("ui.main_window")
 
 
+class _MainThreadBridge(QObject):
+    """跨线程安全桥接器：将任意回调从工作线程投递到主线程执行。
+
+    WebSocket 和线程池回调不能直接操作 Qt Widget，必须通过此桥接器
+    将回调投递到主线程事件循环。使用 Qt 信号-槽机制实现线程安全。
+
+    用法：
+        bridge = _MainThreadBridge(self._some_method, self)
+        self.session_manager.add_listener(bridge)  # bridge 可作为 listener
+    """
+
+    _dispatch = Signal(object)  # 携带一个可调用对象
+
+    def __init__(self, callback, parent=None):
+        super().__init__(parent)
+        self._callback = callback
+        self._dispatch.connect(self._on_dispatch, Qt.ConnectionType.QueuedConnection)
+
+    def _on_dispatch(self, args):
+        """在主线程执行回调。"""
+        try:
+            if isinstance(args, tuple):
+                self._callback(*args)
+            else:
+                self._callback(args)
+        except Exception as e:
+            log.warning("主线程桥接回调异常: %s", e)
+
+    def __call__(self, *args):
+        """从任何线程调用：发射信号，由主线程槽函数处理。"""
+        if len(args) == 1:
+            self._dispatch.emit(args[0])
+        else:
+            self._dispatch.emit(args)
+
+
 class MainWindow(QMainWindow):
     """DSH Work 主窗口（TRAE Work 风格布局）。"""
 
@@ -79,6 +119,8 @@ class MainWindow(QMainWindow):
         self.usage_panel = UsagePanel(self.dsh.usage, self.dsh.balance)
         self.right_panel = RightPanel(self)
         self.status_bar = StatusBar(self)
+
+        self._started_at = time.time()  # 启动时间戳，用于 closeEvent 启动保护
 
         self._setup_window()
         self._setup_layout()
@@ -188,6 +230,7 @@ class MainWindow(QMainWindow):
         self.center_panel.card_clicked.connect(self._on_card_clicked)
         self.center_panel.scrolled_to_top.connect(self._on_scrolled_to_top)
         self.center_panel.files_dropped.connect(self._on_files_dropped)
+        self.center_panel.mode_changed.connect(self._on_mode_from_input)
         # 余额内联小部件：点击刷新
         self.center_panel.balance_refresh_requested.connect(self._action_refresh_balance)
 
@@ -205,8 +248,9 @@ class MainWindow(QMainWindow):
         # 模式管理器（兼容旧逻辑：preset→mode 映射后走 mode_manager 分发）
         self.mode_manager.add_listener(self._on_mode_state_changed)
 
-        # 会话管理器
-        self.session_manager.add_listener(self._on_session_changed)
+        # 会话管理器（使用跨线程桥接器，因为 WebSocket 回调在独立线程执行）
+        self._session_event_bridge = _MainThreadBridge(self._on_session_changed, self)
+        self.session_manager.add_listener(self._session_event_bridge)
 
         # 系统托盘
         self.system_tray.new_session_requested.connect(self._action_new_session)
@@ -244,6 +288,13 @@ class MainWindow(QMainWindow):
                     tray.messageClicked.connect(self._on_restore)
                 except Exception:  # 老版 Qt 没有该信号时静默
                     pass
+
+        # 迷你浮窗（独立于托盘，仅受 config.mini_float_window 控制）
+        if self.config.mini_float_window:
+            try:
+                self.system_tray.set_mini_float_enabled(True)
+            except Exception as e:
+                log.warning("启用迷你浮窗失败: %s", e)
 
         # 余额内联小部件：初始化显示 + 延迟首次查询（避免与 DSH 初始化抢资源）
         self.center_panel.set_turn_cost(0.0, 0.0)
@@ -324,6 +375,13 @@ class MainWindow(QMainWindow):
 
     def _on_mode_state_changed(self, state) -> None:
         log.debug("模式状态已更新: %s", state.mode.value)
+
+    def _on_mode_from_input(self, mode: str) -> None:
+        """输入框模式切换时更新配置。"""
+        self.config.mode = mode
+        self.config.save()
+        self.right_panel.set_mode(mode)
+        log.info("输入框模式已切换: %s", mode)
 
     def _action_toggle_preset(self) -> None:
         """循环切换下一个 preset（标准 → PTC → 极简 → 创造 → 标准…）。"""
@@ -516,8 +574,36 @@ class MainWindow(QMainWindow):
             color="#32F08C" if dsh_ok else "#FFB454", duration_ms=2500,
         )
 
-    def _on_session_changed(self, session_id: str, state) -> None:
-        # 通用状态同步（每次事件都更新）
+    def _on_session_changed(self, session_id, state_or_event, event_data=None):
+        # ====== 关键修复：会话隔离 ======
+        # 必须校验 session_id 是否是当前 UI 展示的会话，否则 A 会话的事件
+        # 会写到 B 会话的消息流里，造成"发第二个对话时返回第一个回答"的串线。
+        if session_id != self.session_manager.current_session_id:
+            log.debug(
+                "忽略非当前会话的 UI 事件: incoming=%s current=%s",
+                session_id, self.session_manager.current_session_id,
+            )
+            return
+
+        # 支持两种调用签名：
+        #   (session_id, state)                          — 来自 _notify，从 state 读取事件数据
+        #   (session_id, event_type, event_data)          — 来自 _notify_with，使用捕获的快照
+        if event_data is not None:
+            event_type = state_or_event
+            data = event_data
+            state = self.session_manager.current_session
+        else:
+            state = state_or_event
+            event_type = getattr(state, "last_event_type", "")
+            data = getattr(state, "last_event_data", {}) or {}
+
+        if state is None:
+            return
+
+        log.info("[DEBUG] _on_session_changed event_type=%s is_streaming=%s agent_status=%s",
+                 event_type, self.center_panel.is_streaming(), state.agent_status.value)
+
+        # 通用状态同步（仅当前会话）
         self.center_panel.set_agent_status(state.agent_status)
         self.status_bar.set_agent_status(
             state.agent_status, state.current_turn, state.current_step
@@ -535,37 +621,43 @@ class MainWindow(QMainWindow):
         # 余额内联小部件：本轮消耗 + 会话累计
         self.center_panel.set_turn_cost(state.last_turn_cost, state.session_total_cost)
 
-        # 事件特定路由：根据 last_event_type 把数据送到对应 UI 组件
-        # （修复前所有事件只更新状态栏，消息流/工具卡片/预览均不刷新）
-        event_type = getattr(state, "last_event_type", "")
+        # 事件特定路由：根据 event_type 把数据送到对应 UI 组件
         if not event_type:
             return
-        data = getattr(state, "last_event_data", {}) or {}
 
         if event_type == "chunk":
             # 流式文本块 → 追加到当前流式气泡
             chunk = data.get("chunk", "")
+            log.info("[DEBUG] chunk事件: chunk_len=%d is_streaming=%s", len(chunk), self.center_panel.is_streaming())
             if chunk:
                 if not self.center_panel.is_streaming():
                     # 重连后中途收到 chunk：补创建流式气泡
+                    log.info("[DEBUG] chunk事件但无流式气泡，补创建")
                     self.center_panel.start_streaming()
                 self.center_panel.append_chunk(chunk)
 
         elif event_type == "turn_start":
             # 新一轮开始：确保有流式气泡
+            log.info("[DEBUG] turn_start事件: is_streaming=%s", self.center_panel.is_streaming())
             if not self.center_panel.is_streaming():
+                log.info("[DEBUG] turn_start: 无流式气泡，创建新气泡")
                 self.center_panel.start_streaming()
 
         elif event_type == "turn_end":
             # 一轮结束：定稿流式气泡
             finalized = data.get("message")
+            log.info("[DEBUG] turn_end事件: is_streaming=%s finalized=%s",
+                     self.center_panel.is_streaming(),
+                     "有内容" if finalized and getattr(finalized, "content", "") else "None/空")
             if self.center_panel.is_streaming():
                 self.center_panel.finish_streaming()
                 # 若本轮无任何内容（空回复），把气泡内容设为占位提示
                 if finalized is None:
+                    log.info("[DEBUG] turn_end: 无最终消息，填充占位")
                     self.center_panel.fill_prompt("")  # 仅刷新布局
             elif finalized is not None:
                 # 无流式气泡但有固化消息（重连后收到 turn_end）：直接添加
+                log.info("[DEBUG] turn_end: 无流式气泡但有固化消息，直接添加")
                 self.center_panel.add_message(finalized)
             # 对话结束：后台异步刷新余额（非强制，命中5分钟缓存则零开销）
             self._query_balance_async(force=False)
@@ -682,7 +774,9 @@ class MainWindow(QMainWindow):
 
         local_msg = MessageRecord(role="user", content=text, timestamp=_time.time())
         self.center_panel.add_message(local_msg)
+        log.info("[DEBUG] _on_send: 已添加用户消息，准备调用 start_streaming, is_streaming=%s", self.center_panel.is_streaming())
         self.center_panel.start_streaming()
+        log.info("[DEBUG] _on_send: start_streaming 已完成，is_streaming=%s", self.center_panel.is_streaming())
 
         # 记录插入前的消息数量（便于失败回滚）
         state = self.session_manager.current_session
@@ -690,6 +784,7 @@ class MainWindow(QMainWindow):
 
         # 取出暂存的附件（拖拽文件时收集）
         attachments = getattr(self, "_pending_attachments", None)
+        log.info("[DEBUG] _on_send: 准备调用 send_message, prev_count=%d, attachments=%s", prev_count, attachments)
         self.session_manager.send_message(text, attachments=attachments)
         # 发送后清空附件暂存
         self._pending_attachments = []
@@ -744,6 +839,9 @@ class MainWindow(QMainWindow):
 
     def _action_stop(self) -> None:
         self.session_manager.cancel_agent()
+        # 停止后立即清理 UI 流式气泡，防止残留
+        if self.center_panel.is_streaming():
+            self.center_panel.finish_streaming()
 
     # ===== 空状态卡片 =====
 
@@ -825,7 +923,7 @@ class MainWindow(QMainWindow):
     def _action_toggle_theme(self) -> None:
         from .theme.theme_manager import ThemeManager
         tm = ThemeManager()
-        tm.load_all()
+        # 主题在启动时已加载，无需重复 load_all()
         current = self.config.theme
         # 循环切换所有已加载主题（与设置面板下拉列表一致）
         all_keys = list(tm.theme_keys.keys())
@@ -840,8 +938,9 @@ class MainWindow(QMainWindow):
         if theme:
             self.config.theme = new_theme
             self.config.save()
+            # 将 QSS 应用到 MainWindow 而非 QApplication，缩小样式重算范围
             qss = tm.generate_qss(theme)
-            QApplication.instance().setStyleSheet(qss)
+            self.setStyleSheet(qss)
 
     # ===== 设置 =====
 
@@ -1029,6 +1128,9 @@ class MainWindow(QMainWindow):
         tray_cb = QCheckBox("关闭窗口时最小化到系统托盘（推荐）")
         tray_cb.setChecked(bool(self.config.minimize_to_tray))
         behave_layout.addRow(tray_cb)
+        mini_float_cb = QCheckBox("显示迷你浮窗（置顶进度速览）")
+        mini_float_cb.setChecked(bool(self.config.mini_float_window))
+        behave_layout.addRow(mini_float_cb)
         readability_cb = QCheckBox("可读性自动保护")
         readability_cb.setChecked(bool(self.config.readability_protection))
         behave_layout.addRow(readability_cb)
@@ -1098,13 +1200,14 @@ class MainWindow(QMainWindow):
                 theme = tm.set_current(new_theme_key)
                 if theme:
                     qss = tm.generate_qss(theme)
-                    QApplication.instance().setStyleSheet(qss)
+                    self.setStyleSheet(qss)
             ws = ws_edit.text().strip()
             if ws != self.config.workspace:
                 self.config.workspace = ws
                 self.title_bar.set_workspace(ws)
                 self.left_panel.load_workspace(ws)
             self.config.minimize_to_tray = tray_cb.isChecked()
+            self.config.mini_float_window = mini_float_cb.isChecked()
             self.config.readability_protection = readability_cb.isChecked()
             self.config.balance_source_label = balance_label_cb.isChecked()
             if not self.config.minimize_to_tray:
@@ -1117,6 +1220,11 @@ class MainWindow(QMainWindow):
                     self.system_tray.setup()
                 except Exception:
                     pass
+            # 迷你浮窗开关即时生效
+            try:
+                self.system_tray.set_mini_float_enabled(self.config.mini_float_window)
+            except Exception as e:
+                log.warning("切换迷你浮窗失败: %s", e)
             self.config.save()
             log.info("设置已保存")
             dlg.accept()
@@ -1161,6 +1269,13 @@ class MainWindow(QMainWindow):
     # ===== 窗口关闭 =====
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        log.info("closeEvent 触发: minimize_to_tray=%s", self.config.minimize_to_tray)
+        # 启动保护：阻止应用在启动后 10 秒内意外退出（如 workspace-not-found 等初始化异常）
+        _elapsed = time.time() - getattr(self, "_started_at", time.time())
+        if _elapsed < 10.0:
+            log.warning("启动未满 10 秒（%.1fs），阻止 closeEvent 退出，请检查上方的 _on_quit 调用栈", _elapsed)
+            event.ignore()
+            return
         if self.config.minimize_to_tray and self.system_tray:
             event.ignore()
             self.hide()
@@ -1173,7 +1288,14 @@ class MainWindow(QMainWindow):
         if getattr(self, "_quit_triggered", False):
             return
         self._quit_triggered = True
-        log.info("DSH Work 正在退出...")
+        # 退出前保存对话
+        self._save_conversation_state()
+        import traceback, sys as _sys
+        stack = "".join(traceback.format_stack()[:-1])
+        # 用 warning 级别确保调用栈可见（info 级别可能被日志配置截断）
+        log.warning("DSH Work 正在退出... 调用栈:\n%s", stack)
+        _sys.stderr.write(f"\n*** _on_quit 调用栈:\n{stack}\n")
+        _sys.stderr.flush()
         try:
             if self.dsh is not None:
                 self.dsh.shutdown()
@@ -1185,36 +1307,132 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.quit_requested.emit()
+        # 延迟退出：用单次定时器将 quit 调用推迟到当前事件（菜单模态事件循环）处理完毕之后，
+        # 否则 Qt 的嵌套事件循环不会处理退出请求，导致进程一直挂着。
         try:
-            QApplication.instance().quit()
+            QTimer.singleShot(0, QApplication.instance().quit)
         except Exception:
             pass
+
+    # ===== 对话持久化 =====
+
+    def _conversation_cache_path(self) -> Path:
+        """缓存文件路径：appdata 目录下的 conversation_cache.json。"""
+        from ..config import get_app_data_dir
+        return get_app_data_dir() / "conversation_cache.json"
+
+    def _save_conversation_state(self) -> None:
+        """保存当前会话的消息到本地缓存（退出时调用）。"""
+        try:
+            state = self.session_manager.current_session
+            if not state or not state.messages:
+                return
+            cache = []
+            for m in state.messages:
+                cache.append({
+                    "role": getattr(m, "role", ""),
+                    "content": getattr(m, "content", ""),
+                    "timestamp": getattr(m, "timestamp", 0.0),
+                })
+            data = {
+                "session_id": self.session_manager.current_session_id or "",
+                "session_title": getattr(state.info, "title", ""),
+                "messages": cache,
+                "saved_at": time.time(),
+            }
+            path = self._conversation_cache_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            log.info("已保存 %d 条消息到缓存", len(cache))
+        except Exception as e:
+            log.warning("保存对话缓存失败: %s", e)
+
+    def _load_conversation_state(self) -> None:
+        """从本地缓存恢复对话（启动时调用）。"""
+        try:
+            path = self._conversation_cache_path()
+            if not path.exists():
+                return
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            messages = data.get("messages", [])
+            session_id = data.get("session_id", "")
+            session_title = data.get("session_title", "")
+            if not messages:
+                return
+            # 通过 session_manager 创建或恢复会话
+            from ..api.dsh_service import SessionInfo, MessageRecord
+            # 先尝试找 DSH 侧同 ID 的会话
+            existing = self.session_manager.sessions.get(session_id)
+            state = existing
+            if state is None:
+                # 创建本地恢复会话
+                info = SessionInfo(
+                    id=session_id,
+                    title=session_title or "恢复的会话",
+                    created_at=time.time(),
+                    updated_at=time.time(),
+                    message_count=len(messages),
+                )
+                state = self.session_manager._sessions.get(session_id)
+                if state is None:
+                    from ..core.session_manager import SessionState
+                    state = SessionState(info=info)
+                    self.session_manager._sessions[session_id] = state
+            # 恢复消息（去重）
+            restored = 0
+            for m_data in messages:
+                ts = m_data.get("timestamp", 0.0)
+                if ts not in state._msg_ts_index:
+                    state._msg_ts_index.add(ts)
+                    state.messages.append(MessageRecord(
+                        role=m_data.get("role", "user"),
+                        content=m_data.get("content", ""),
+                        timestamp=ts,
+                    ))
+                    restored += 1
+            # 切换到恢复的会话
+            self.session_manager.switch_to(session_id)
+            # 刷新 UI
+            self._on_session_selected(session_id)
+            log.info("已从缓存恢复 %d 条消息（session=%s）", restored, session_id)
+        except Exception as e:
+            log.warning("加载对话缓存失败: %s", e)
 
     # ===== 运行时状态更新 =====
 
     def update_runtime_status(self) -> None:
-        def on_balance(result):
-            self.status_bar.set_balance(result)
-            # 同时刷新内联小部件的余额
-            QTimer.singleShot(0, lambda: self.center_panel.set_balance(result))
-        self.dsh.balance.query_async(on_balance)
+        """后台异步查询余额，更新状态栏与内联小部件。
+
+        注意：query_async 的回调在线程池 worker 中执行，不能直接操作 Qt Widget。
+        使用 _MainThreadBridge 安全投递到主线程。
+        """
+        bridge = _MainThreadBridge(
+            lambda result: (
+                self.status_bar.set_balance(result),
+                self.center_panel.set_balance(result),
+            ),
+            self,
+        )
+        self.dsh.balance.query_async(bridge)
 
     def _query_balance_async(self, force: bool = False) -> None:
         """后台异步查询余额，结果同时更新状态栏与内联小部件。
 
-        回调在 worker 线程执行，通过 QTimer.singleShot(0, ...) 把 UI 更新
-        投递回主线程（避免跨线程直接操作 Qt widget）。
+        query_async 的回调在线程池 worker 中执行，不能直接调用 QTimer.singleShot。
+        使用 _MainThreadBridge 安全投递到主线程。
         """
         if self.dsh is None or self.dsh.balance is None:
             return
         try:
-            def on_result(result):
-                # 跨线程安全：QTimer.singleShot(0, cb) 把 cb 放到主线程事件队列
-                def apply_ui():
-                    self.status_bar.set_balance(result)
-                    self.center_panel.set_balance(result)
-                QTimer.singleShot(0, apply_ui)
-            self.dsh.balance.query_async(on_result, force=force)
+            bridge = _MainThreadBridge(
+                lambda result: (
+                    self.status_bar.set_balance(result),
+                    self.center_panel.set_balance(result),
+                ),
+                self,
+            )
+            self.dsh.balance.query_async(bridge, force=force)
         except Exception as e:
             log.warning("触发余额异步查询失败: %s", e)
 

@@ -340,6 +340,14 @@ class SplashScreen(QDialog):
 
     def _poll_worker(self) -> None:
         """主线程轮询 worker 共享变量，更新 UI。"""
+        try:
+            self._do_poll_worker()
+        except KeyboardInterrupt:
+            log.warning("用户中断启动画面轮询（Ctrl+C），继续等待环境检测完成...")
+            # KeyboardInterrupt 在 Qt 事件循环中可能被吞掉，但不会影响 _poll_timer 继续触发
+            # 只需要确保 _poll_worker 不会因为一次中断而永久停止
+
+    def _do_poll_worker(self) -> None:
         if self._worker is None:
             return
 

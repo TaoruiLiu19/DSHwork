@@ -36,7 +36,12 @@ def get_themes_dir() -> Path:
 
 
 def get_logs_dir() -> Path:
-    d = get_app_data_dir() / C.LOG_DIRNAME
+    """返回日志目录（项目根目录下的 logs/ 文件夹），不存在则创建。
+
+    日志保存在项目文件夹中，方便后续其他人遇到问题时直接查看日志排查。
+    """
+    proj_root = Path(__file__).resolve().parent.parent  # dsh_work/ 的父目录 = 项目根目录
+    d = proj_root / C.LOG_DIRNAME
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -109,6 +114,8 @@ class UserConfig:
     minimize_to_tray: bool = True
     # 迷你浮窗（默认关）
     mini_float_window: bool = False
+    # 迷你浮窗位置（右下角停靠）持久化
+    mini_float_pos: Any = None
     # 步骤切换系统通知（默认关）
     step_notification: bool = False
     # 余额来源标注

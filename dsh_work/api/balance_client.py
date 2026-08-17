@@ -204,9 +204,18 @@ class BalanceClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            # 平台 API 返回格式适配
-            balance = float(data.get("balance") or data.get("amount", 0))
-            currency = data.get("currency", "CNY")
+            # 平台 API 返回格式：{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"34.77",...}]}
+            # 兼容两种格式：新格式 balance_infos[0].total_balance 与旧格式 balance/amount 顶层字段
+            balance = 0.0
+            currency = "CNY"
+            infos = data.get("balance_infos") or []
+            if infos and isinstance(infos, list):
+                first = infos[0]
+                balance = float(first.get("total_balance") or first.get("balance") or 0)
+                currency = first.get("currency") or "CNY"
+            else:
+                balance = float(data.get("balance") or data.get("amount") or 0)
+                currency = data.get("currency") or "CNY"
             log.info("余额查询成功（平台直连）: %.2f %s", balance, currency)
             return BalanceResult(
                 balance=balance,

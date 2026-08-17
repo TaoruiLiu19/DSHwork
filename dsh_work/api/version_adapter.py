@@ -151,8 +151,12 @@ class VersionAdapter:
     def _full_probe(self) -> AdapterProbeResult:
         """按候选 RPC 方法逐个尝试，取最先返回 dict 且含 version 字段的。"""
         for method in C.ADAPTER_PROBE_METHODS:
+            # 部分方法需要特定 payload 才合法（否则 bad-request），逐个校正
+            probe_payload: dict[str, Any] = {}
+            if method == "credentials.describe":
+                probe_payload = {"refs": []}
             try:
-                data = self.http.call(method, {})
+                data = self.http.call(method, probe_payload)
                 if not isinstance(data, dict):
                     continue
                 version = data.get("version")

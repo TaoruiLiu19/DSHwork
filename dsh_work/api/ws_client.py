@@ -17,7 +17,7 @@ import json
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 from collections.abc import Awaitable
 
 from .. import constants as C
@@ -60,14 +60,45 @@ class WSMessage:
     # DSH 事件流不一定自带递增 ID，若提供则记录
     event_id: str | None = None
 
+    # DSH domain/action 类型 → 客户端 WSEventType 映射
+    _DSH_TYPE_MAP: ClassVar[dict[str, str]] = {
+        "assistant/chunk": "chunk",
+        "turn/start": "turn_start",
+        "turn/end": "turn_end",
+        "step/start": "step_start",
+        "step/end": "step_end",
+        "session/created": "session_created",
+        "session/deleted": "session_deleted",
+    }
+
     @classmethod
     def from_raw(cls, raw: dict, local_seq: int) -> WSMessage:
         """从原始 JSON 解析消息。兼容多种帧格式：
         - 直接 {type, session_id, data, event_id}
         - Typert 框架 {payload: {type, ...}}
         - envelope {result: {value: {...}}}
+        - DSH events.mux 帧 {type: "session/event", sessionId, event: {type, data}}，
+          真实事件在 event 子对象里，类型为 domain/action（如 assistant/chunk）。
+          外层 sessionId 优先保留，不要因为解包 event 而丢失。
         """
-        # 解包 payload/value 信封
+        # 先保留外层（未剥壳前）的 session 标识，DSH events.mux 结构为：
+        #   {type: "session/event", sessionId: "...", event: {type, data}}
+        # 外层 sessionId 是该事件真正归属的会话，event.data 里不一定有。
+        outer_session_id = (
+            raw.get("sessionId")
+            or raw.get("session_id")
+            or (
+                raw.get("payload").get("sessionId")
+                if isinstance(raw.get("payload"), dict)
+                else None
+            )
+            or (
+                raw.get("payload").get("session_id")
+                if isinstance(raw.get("payload"), dict)
+                else None
+            )
+        )
+
         body = raw
         if isinstance(body.get("payload"), dict):
             body = body["payload"]
@@ -76,21 +107,34 @@ class WSMessage:
             if isinstance(val, dict):
                 body = val
 
-        event_type_str = (
-            body.get("type")
-            or body.get("event")
-            or body.get("eventType")
-            or raw.get("type")
-            or "unknown"
-        )
+        # DSH events.mux：解包 session/event 包裹，取 event.type 与 event.data
+        wrapped_event = body.get("event")
+        if isinstance(wrapped_event, dict):
+            event_data = wrapped_event.get("data")
+            if isinstance(event_data, dict):
+                body = event_data
+            event_type_str = str(wrapped_event.get("type") or body.get("type") or "unknown")
+        else:
+            event_type_str = str(
+                body.get("type")
+                or body.get("event")
+                or body.get("eventType")
+                or raw.get("type")
+                or "unknown"
+            )
+
+        # 把 DSH 的 domain/action 类型映射到 WSEventType 已知值
+        event_type_str = cls._DSH_TYPE_MAP.get(event_type_str, event_type_str)
         try:
-            event_type = WSEventType(str(event_type_str))
+            event_type = WSEventType(event_type_str)
         except ValueError:
             event_type = WSEventType.UNKNOWN
         return cls(
             local_seq=local_seq,
             session_id=str(
-                body.get("session_id")
+                # 外层 sessionId 优先级最高（来自 session/event 包裹）
+                outer_session_id
+                or body.get("session_id")
                 or body.get("sessionId")
                 or raw.get("session_id")
                 or raw.get("sessionId")

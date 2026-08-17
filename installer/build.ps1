@@ -1,4 +1,4 @@
-# ===== DSH Work 一键构建脚本（PyInstaller onedir + Inno Setup 安装包）=====
+# ===== DSH Work 一键构建脚本（PyInstaller onefile + Inno Setup 安装包）=====
 #
 # 用法（在项目根目录）：
 #   .\installer\build.ps1              # 构建 exe + 安装包
@@ -10,7 +10,7 @@
 #   - Inno Setup 6（仅编译安装包时需要，https://jrsoftware.org/isdl.php）
 #
 # 产物：
-#   dist\DSHWork\DSHWork.exe                 主程序（onedir）
+#   dist\DSHWork.exe                         主程序（onefile 单文件）
 #   installer\Output\DSHWork-Setup-<ver>.exe  安装包（-SkipInstaller 时跳过）
 
 param(
@@ -35,17 +35,17 @@ Write-Step "确认 pyinstaller 已安装"
 & $py -m pip install "pyinstaller>=6.0" --quiet 2>$null
 & $py -c "import PyInstaller; print('pyinstaller', PyInstaller.__version__)"
 
-# ---- 2. PyInstaller 打包（onedir）----
-Write-Step "PyInstaller 打包 dsh_work.spec"
+# ---- 2. PyInstaller 打包（onefile）----
+Write-Step "PyInstaller 打包 dsh_work.spec（onefile 模式）"
 $env:PYTHONDONTWRITEBYTECODE = "1"   # 避免向系统 Python 的 __pycache__ 写临时 pyc（沙箱/权限受限时必需）
 if ($DebugConsole) { $env:DSHWORK_DEBUG_CONSOLE = "1" }
 $pyi = Join-Path $venv "Scripts\pyinstaller.exe"
 & $pyi dsh_work.spec --noconfirm --log-level WARN
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败 (rc=$LASTEXITCODE)" }
 
-$exe = Join-Path $root "dist\DSHWork\DSHWork.exe"
+$exe = Join-Path $root "dist\DSHWork.exe"
 if (-not (Test-Path $exe)) { throw "未找到产物 $exe" }
-Write-Host "EXE 产出: $exe ($((Get-Item $exe).Length) bytes)" -ForegroundColor Green
+Write-Host "EXE 产出: $exe ($([math]::Round((Get-Item $exe).Length/1MB,1)) MB)" -ForegroundColor Green
 
 if ($SkipInstaller) {
     Write-Host "跳过安装包编译（-SkipInstaller）" -ForegroundColor Yellow
@@ -75,4 +75,5 @@ if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败 (rc=$LASTEXITCODE)" }
 $setup = Join-Path $root "installer\Output\DSHWork-Setup-0.3.0.exe"
 if (Test-Path $setup) {
     Write-Host "安装包产出: $setup ($([math]::Round((Get-Item $setup).Length/1MB,1)) MB)" -ForegroundColor Green
+    Write-Host "安装包比对: DSHWork.exe 自身 $([math]::Round((Get-Item (Join-Path $root 'dist\DSHWork.exe')).Length/1MB,1)) MB —— 安装包通常比单 exe 小 ~10MB（LZMA2 压缩）" -ForegroundColor Green
 }

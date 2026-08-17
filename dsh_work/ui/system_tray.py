@@ -26,6 +26,9 @@ from PySide6.QtWidgets import QMenu, QApplication, QSystemTrayIcon
 
 from ..core.session_manager import AgentStatus
 from .. import constants as C
+from ..utils.logger import get_logger
+
+log = get_logger("ui.system_tray")
 
 
 class SystemTray(QObject):
@@ -45,6 +48,8 @@ class SystemTray(QObject):
         self._agent_status = AgentStatus.IDLE
         self._step_text = ""
         self._session_title = ""
+        self._mini_float_enabled = False
+        self._mini_float = None
 
     def setup(self) -> None:
         """初始化系统托盘。"""
@@ -120,6 +125,24 @@ class SystemTray(QObject):
         if self._tray:
             self._tray.setIcon(self._create_icon(connected, self._agent_status != AgentStatus.IDLE))
 
+    def set_mini_float_enabled(self, enabled: bool) -> None:
+        """启用/停用迷你浮窗（随 config.mini_float_window 切换）。"""
+        self._mini_float_enabled = bool(enabled)
+        try:
+            if enabled:
+                if self._mini_float is None:
+                    from .widgets.mini_float import MiniFloatWindow
+                    self._mini_float = MiniFloatWindow()
+                    self._mini_float.restore_requested.connect(self.restore_requested)
+                self._mini_float.set_agent_status(
+                    self._agent_status, self._session_title, self._step_text
+                )
+                self._mini_float.show()
+            elif self._mini_float is not None:
+                self._mini_float.hide()
+        except Exception as e:
+            log.warning("迷你浮窗切换失败: %s", e)
+
     def set_agent_status(self, status: AgentStatus, session_title: str = "", step_text: str = "") -> None:
         """更新 Agent 状态（影响图标颜色与 tooltip）。"""
         self._agent_status = status
@@ -137,6 +160,9 @@ class SystemTray(QObject):
                 parts.append(status.value)
             tooltip = " · ".join(parts) if parts else "DSH Work"
             self._tray.setToolTip(tooltip[:128])  # tooltip 长度限制
+        # 同步迷你浮窗
+        if self._mini_float and self._mini_float_enabled:
+            self._mini_float.set_agent_status(status, session_title, step_text)
 
     def notify(self, title: str, message: str) -> None:
         """弹出系统通知（Agent 完成长任务时调用）。"""
@@ -150,3 +176,8 @@ class SystemTray(QObject):
     def hide(self) -> None:
         if self._tray:
             self._tray.hide()
+        if self._mini_float is not None:
+            try:
+                self._mini_float.hide()
+            except Exception as e:
+                log.warning("隐藏迷你浮窗失败: %s", e)

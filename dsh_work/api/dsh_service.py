@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -77,6 +78,9 @@ class DshService:
         self.ws = WebSocketClient(ws_base_url=ws_base)
         self.adapter = VersionAdapter(self.http)
         self.balance = BalanceClient(self.http)
+        # 降级通道预注入：DSH 不支持 credentials.getBalance 时，从本机凭据文件读取
+        # 临时 Key（仅内存，不落盘），保证余额查询可直连平台降级。
+        self._inject_balance_temp_key()
         # 懒加载：避免 api → core → session_manager → api 的循环导入
         from ..core.usage_tracker import UsageTracker
         self.usage = UsageTracker()  # 用量与消耗追踪（10 万条持久化 + 峰谷计费）
@@ -90,6 +94,27 @@ class DshService:
         self._default_provider: str = "deepseek-official"  # DSH 0.0.1 默认内置 provider id
 
     # ===== 生命周期 =====
+
+    def _inject_balance_temp_key(self) -> None:
+        """从本机凭据文件读取 API Key，注入余额降级通道（仅内存，不落盘）。
+
+        首选通道 credentials.getBalance 依赖 DSH 支持该 RPC；若 DSH 版本不支持，
+        降级通道需要平台直连，此时必须有 Key。这里统一从 ~/.dsh/.credentials.yaml
+        读取，避免调用方各自实现读取逻辑。
+        """
+        try:
+            import os
+            import re
+            creds_file = os.path.join(os.path.expanduser("~"), ".dsh", ".credentials.yaml")
+            if not os.path.isfile(creds_file):
+                return
+            with open(creds_file, "r", encoding="utf-8") as f:
+                txt = f.read()
+            m = re.search(r"DEEPSEEK_API_KEY\s*:\s*['\"]?([^'\"\n]+)", txt)
+            if m and m.group(1).strip():
+                self.balance.set_temp_api_key(m.group(1).strip())
+        except Exception as e:
+            log.warning("注入余额临时 Key 失败（不致命）: %s", e)
 
     def initialize(self) -> AdapterProbeResult:
         """初始化：探测 DSH 版本与能力。"""
@@ -147,6 +172,11 @@ class DshService:
         DSH Typert schema 严格 camelCase，缺字段用默认值：
           payload 允许完全为空（{}），DSH 会生成默认会话。
           title / model / workspaceId / agentPreset 仅在非空时传，避免 unknown-field 校验。
+
+        工作区路径容错：
+          · 若路径包含非 ASCII 字符（如中文），DSH 可能无法识别
+          · 若路径不存在于磁盘上，DSH 同样无法识别
+          以上两种情况跳过 workspace 参数，避免 session.create 返回 workspace-not-found 错误。
         """
         payload: dict[str, Any] = {}
         if title:
@@ -155,8 +185,23 @@ class DshService:
             payload["model"] = model
             provider = self._model_provider.get(model) or self._default_provider
             payload["provider"] = provider
+
+        # 工作区路径容错：非 ASCII 字符或路径不存在时跳过 workspace 参数
+        _workspace_ok = False
         if workspace:
+            try:
+                # 检查是否包含非 ASCII 字符
+                if not all(ord(c) < 128 for c in workspace):
+                    log.warning("工作区路径包含非 ASCII 字符，DSH 可能无法识别，跳过 workspace 参数: %s", workspace)
+                elif not os.path.isdir(workspace):
+                    log.warning("工作区路径不存在，跳过 workspace 参数: %s", workspace)
+                else:
+                    _workspace_ok = True
+            except Exception:
+                pass
+        if _workspace_ok:
             payload["workspaceId"] = workspace
+
         if agent_preset:
             # sessionCreateRequestSchema 显式定义了 agentPreset: z.string().optional()
             payload["agentPreset"] = agent_preset
@@ -219,21 +264,53 @@ class DshService:
         if since_timestamp:
             params["sinceTimestamp"] = since_timestamp
         result = self.http.call("session.history", params)
-        # session.models 返回 {events, hasMore, projections}，统一从 events 取
+        # DSH 返回 {events, hasMore, projections}；events 里每条是
+        # {"event": {"type": "user/message|assistant/message|...", "data": {...}}}。
+        # 只提取消息类事件，避免把 sandbox/mode、turn/start 等非消息事件当成消息。
         messages: Any = []
-        if isinstance(result, list):
+        if isinstance(result, dict):
+            events = result.get("events")
+            if isinstance(events, list):
+                messages = self._extract_messages_from_events(events)
+            else:
+                for key in ("messages", "items", "entries"):
+                    arr = result.get(key)
+                    if isinstance(arr, list):
+                        messages = arr
+                        break
+        elif isinstance(result, list):
             messages = result
-        elif isinstance(result, dict):
-            messages = (
-                result.get("events")
-                or result.get("messages")
-                or result.get("items")
-                or result.get("entries")
-                or []
-            )
         if not isinstance(messages, list):
             return []
         return [self._parse_message(m) for m in messages if isinstance(m, dict)]
+
+    @staticmethod
+    def _extract_messages_from_events(events: list) -> list[dict]:
+        """从 session.history 的 events 里筛出消息类事件（user/assistant/tool/system）。
+
+        每个 event 形如 {"event": {"type": "...", "data": {...}}}，也可能直接平铺。
+        只返回消息事件携带的 data（非消息事件如 sandbox/mode、turn/start 会被忽略，
+        它们没有 role/content，不应出现在消息记录里）。
+        """
+        _MESSAGE_EVENT_TYPES = {
+            "user/message", "assistant/message", "tool/message", "system/message",
+            "user_message", "assistant_message", "tool_message", "system_message",
+        }
+        out: list[dict] = []
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            ev = e.get("event") if isinstance(e.get("event"), dict) else e
+            etype = str(ev.get("type") or "")
+            data = ev.get("data")
+            if not isinstance(data, dict):
+                continue
+            if etype in _MESSAGE_EVENT_TYPES:
+                out.append(data)
+            elif "role" in data or "message" in data:
+                # 兼容非标准结构：直接带 role 或 message 子对象的视为消息
+                out.append(data)
+        return out
 
     def select_model(self, session_id: str, model: str) -> bool:
         """切换模型。DSH Typert 严格要求 {sessionId, model, provider} 三个 camelCase 字段。"""
@@ -329,13 +406,55 @@ class DshService:
             )
         return list(items) if isinstance(items, list) else []
 
+    _IMAGE_MEDIA_TYPES = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif",
+    }
+
     def send_message(self, session_id: str, content: str, attachments: list[str] | None = None) -> Any:
-        """发送消息到会话（触发 Agent 流式生成，事件走 events.mux WS）。"""
-        payload: dict[str, Any] = {"sessionId": session_id, "content": content}
-        if attachments:
-            payload["attachments"] = attachments
-        # Typert: session.prompt 返回的是 {messageId} 之类的排队回执（流式 chunk 走 WS）
+        """发送消息到会话（触发 Agent 流式生成，事件走 events.mux WS）。
+
+        当前 DSH 运行时(0.0.1)的 session.prompt 采用严格 schema：
+          payload = { sessionId, mode: "queue"|"steer", content: [text|image 块] }
+          - 空闲发消息用 mode="steer"
+          - content 为块数组：{"type":"text","text":str} 或
+            {"type":"image","mediaType":"image/png|jpeg|webp|gif","data":<base64>}
+        旧版直接传字符串 content 的写法会被 schema 拒绝（bad-request）。
+        """
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": content}]
+        for att in (attachments or []):
+            block = self._image_content_block(att)
+            if block:
+                blocks.append(block)
+            else:
+                log.warning("附件非受支持图片，发送消息时忽略: %s", att)
+        payload: dict[str, Any] = {
+            "sessionId": session_id,
+            "mode": "steer",
+            "content": blocks,
+        }
+        # Typert: session.prompt 返回的是 {accepted:true} 之类的回执（流式 chunk 走 WS）
         return self.http.call("session.prompt", payload)
+
+    @staticmethod
+    def _image_content_block(path: str) -> dict[str, Any] | None:
+        """把本地图片路径转成 session.prompt 的 image 内容块；非图片返回 None。"""
+        try:
+            import base64
+            ext = os.path.splitext(path)[1].lower()
+            media_type = DshService._IMAGE_MEDIA_TYPES.get(ext)
+            if not media_type:
+                return None
+            with open(path, "rb") as f:
+                data = f.read()
+            return {
+                "type": "image",
+                "mediaType": media_type,
+                "data": base64.b64encode(data).decode("ascii"),
+            }
+        except Exception as e:
+            log.warning("构造图片内容块失败 %s: %s", path, e)
+            return None
 
     def update_queue(self, session_id: str, content: str) -> Any:
         """Agent 运行时追加消息到队列（排队等待下一轮）。"""
@@ -389,33 +508,50 @@ class DshService:
         有配置时：{'has_key': True, 'configured': True, 'valid': bool, 'provider': str, 'details': {...}}
         无配置或接口错误：返回空 dict（旧代码对 Falsey 值当"未配置"处理）。
         """
+        # DSH Typert schema 严格要求 refs: array。必须传具体的 ref 名才查得到，
+        # 传空数组 = 什么都不查，永远返回空。LLM 适配器默认读 DEEPSEEK_API_KEY。
+        ref = "DEEPSEEK_API_KEY"
         try:
-            # DSH Typert schema 严格要求 refs: array（空数组即可）
-            result = self.http.call("credentials.describe", {"refs": []})
+            result = self.http.call("credentials.describe", {"refs": [ref]})
         except RpcError:
             # ok:false 表示未配置 / 读取失败（最常见：尚未 set API Key）
             return {}
         if not isinstance(result, dict):
             return {}
 
-        # credentials.describe 返回 {credentials: {...}}，剥一层
-        inner = result.get("credentials") if isinstance(result.get("credentials"), dict) else result
+        # DSH 返回 {credentials: {DEEPSEEK_API_KEY: {configured, source, writable}}}，
+        # 取该 ref 的视图。
+        creds_map = result.get("credentials")
+        if isinstance(creds_map, dict):
+            view = creds_map.get(ref)
+            if isinstance(view, dict):
+                configured = bool(view.get("configured"))
+                return {
+                    "configured": configured,
+                    "has_key": configured,
+                    "hasKey": configured,
+                    "valid": configured,
+                    "provider": str(view.get("source") or ""),
+                    "raw": result,  # 原始值保留给调试用
+                }
+            # 该 ref 未配置
+            return {}
 
-        # 兼容多种返回结构：规范化
+        # 兼容旧结构：直接剥一层
+        inner = result.get("credentials") if isinstance(result.get("credentials"), dict) else result
         configured = bool(
             _get(inner, "configured", "hasKey", "has_key", "isConfigured", "set")
         )
         valid = bool(_get(inner, "valid", "isValid", "ok", default=configured))
         provider = str(_get(inner, "provider", "activeProvider", default="") or "")
-        normalized = {
+        return {
             "configured": configured,
             "has_key": configured,
             "hasKey": configured,
             "valid": valid,
             "provider": provider,
-            "raw": result,  # 原始值保留给调试用
+            "raw": result,
         }
-        return normalized
 
     # ===== 余额查询 =====
 
@@ -486,9 +622,14 @@ class DshService:
     def _parse_message(data: dict) -> MessageRecord:
         if not isinstance(data, dict):
             return MessageRecord(role="user", content="")
-        role = str(_get(data, "role", default="user") or "user")
+        # DSH 的消息 data 有两种形态：
+        #   user/message  : {role, content, source, id} —— 角色/内容在顶层
+        #   assistant/message|tool/message : {message: {role, content, ...}, usage, ...}
+        #     —— 角色/内容在 message 子对象里
+        msg = data.get("message") if isinstance(data.get("message"), dict) else data
+        role = str(_get(msg, "role", default="user") or "user")
         # content 可能是字符串，也可能是 [{type:"text",text:...}] 的块列表
-        raw_content = _get(data, "content", default="")
+        raw_content = _get(msg, "content", default="")
         if isinstance(raw_content, list):
             texts = []
             for block in raw_content:
@@ -503,10 +644,10 @@ class DshService:
             content = str(raw_content or "")
         ts_raw = _get(data, "timestamp", "createdAt", "created_at", "time", default=0)
         ts = _parse_iso_ts(ts_raw, raw=ts_raw)
-        tool_calls = _get(data, "toolCalls", "tool_calls")
+        tool_calls = _get(msg, "toolCalls", "tool_calls")
         if tool_calls is not None and not isinstance(tool_calls, list):
             tool_calls = None
-        metadata = _get(data, "metadata", "meta", default=None)
+        metadata = _get(msg, "metadata", "meta", default=None)
         if metadata is not None and not isinstance(metadata, dict):
             metadata = None
         return MessageRecord(

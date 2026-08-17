@@ -149,7 +149,12 @@ class DshWorkApp:
         """
         splash = SplashScreen(self.process_manager, workspace=self.config.workspace)
         self._splash_worker = splash.worker
-        splash.exec()
+        try:
+            splash.exec()
+        except KeyboardInterrupt:
+            log.warning("用户中断启动画面（Ctrl+C），等待环境检测线程自然结束...")
+            # KeyboardInterrupt 在 Qt 事件循环中可能被捕获，但为了安全起见，
+            # 我们也在这里捕获，确保不会因为中断而跳过环境检测结果读取
         self._env_check = splash.check_result
 
         if self._env_check and not self._env_check.all_ok:
@@ -227,6 +232,8 @@ class DshWorkApp:
         if self.dsh and self.dsh.is_full_mode:
             QTimer.singleShot(100, self.main_window.refresh_models)
             QTimer.singleShot(200, self.main_window.refresh_sessions)
+            # 延迟 500ms 恢复上次的对话缓存（等待 refresh_sessions 完成）
+            QTimer.singleShot(500, self.main_window._load_conversation_state)
 
         # 定时刷新运行时状态（余额等）
         self._status_timer = QTimer()

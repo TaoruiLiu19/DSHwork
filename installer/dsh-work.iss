@@ -1,7 +1,7 @@
 ; ===== DSH Work Windows 安装程序（Inno Setup）=====
 ;
 ; 构建：
-;   1. 先用 PyInstaller 产出 onedir：installer\build.ps1（或手动 pyinstaller dsh_work.spec）
+;   1. 先用 PyInstaller 产出 onefile（单 exe）：pyinstaller dsh_work.spec
 ;   2. 安装 Inno Setup 6（https://jrsoftware.org/isdl.php）
 ;   3. 命令行编译：iscc installer\dsh-work.iss
 ;      或用 Inno Setup Compiler IDE 打开本文件按 F7
@@ -13,6 +13,7 @@
 ; - 用户数据在 ~/.dsh-work/（独立于安装目录），卸载默认保留（用户可手动删）
 ; - 静默安装支持：DSHWork-Setup-x.y.z.exe /VERYSILENT /CURRENTUSER
 ; - 仅 64 位（PySide6 + 便携 Node 均为 x64）
+; - PyInstaller onefile 模式：dist\DSHWork.exe 单文件，无需 _internal 目录
 
 #define MyAppName "DSH Work"
 #define MyAppVersion "0.3.0"
@@ -56,8 +57,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 整个 onedir 产物（DSHWork.exe + _internal\...）递归打入安装包
-Source: "dist\DSHWork\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; PyInstaller onefile：只有单个 exe，直接打进安装包
+Source: "dist\DSHWork.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

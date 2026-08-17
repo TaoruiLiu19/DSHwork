@@ -74,7 +74,7 @@ _probe*.py
 _verify_*.py
 
 # 本项目：本地缓存 / 日志 / 数据
-dsh_work/logs/
+logs/
 *.log
 *.db
 *.sqlite
