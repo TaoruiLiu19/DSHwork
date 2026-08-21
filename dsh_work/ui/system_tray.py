@@ -14,7 +14,7 @@ Agent 完成长任务时，托盘图标闪烁并弹出系统通知。
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -24,10 +24,36 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
+from ..config import get_builtin_icon_path
 from ..core.session_manager import AgentStatus
 from ..utils.logger import get_logger
 
 log = get_logger("ui.system_tray")
+
+# 托盘鲸鱼图标基础尺寸（多尺寸合成，Windows 自适应清晰度）
+_TRAY_SIZES = (16, 24, 32)
+# 状态色圆点（右下角）
+_TRAY_DOT_RADIUS_RATIO = 0.22
+
+
+def _tray_whale_pixmap(size: int) -> QPixmap:
+    """渲染指定尺寸的鲸鱼底图（黑色鲸鱼）。"""
+    svg_path = get_builtin_icon_path()
+    if svg_path.exists():
+        icon = QIcon(str(svg_path))
+        pm = icon.pixmap(size, size)
+        if not pm.isNull():
+            return pm
+    # 兜底：纯色圆（图标资源缺失时不至于空托盘）
+    pm = QPixmap(size, size)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor("#1A1B1D"))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawEllipse(2, 2, size - 4, size - 4)
+    p.end()
+    return pm
 
 
 class SystemTray(QObject):
@@ -100,23 +126,30 @@ class SystemTray(QObject):
             self.restore_requested.emit()
 
     def _create_icon(self, connected: bool, running: bool = False) -> QIcon:
-        """生成托盘图标（颜色反映连接状态）。"""
-        pixmap = QPixmap(16, 16)
-        pixmap.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # 连接状态色（TRAE token）
-        if running:
-            color = QColor("#387BFF")  # 工作态蓝色
-        elif connected:
-            color = QColor("#33C192")  # 已连接绿色
-        else:
-            color = QColor("#666B75")  # 未连接灰色
-        painter.setBrush(color)
-        painter.setPen(QColor("#1A1B1D"))
-        painter.drawEllipse(2, 2, 12, 12)
-        painter.end()
-        return QIcon(pixmap)
+        """生成托盘图标：黑色小鲸鱼 + 右下角状态色圆点。
+
+        保留原有状态反馈（绿=已连接 / 灰=未连接 / 蓝=工作态），
+        主图形为 DeepSeek Harness 鲸鱼。
+        """
+        icon = QIcon()
+        for size in _TRAY_SIZES:
+            pm = _tray_whale_pixmap(size)
+            # 右下角状态色小圆点
+            painter = QPainter(pm)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if running:
+                color = QColor("#387BFF")  # 工作态蓝色
+            elif connected:
+                color = QColor("#33C192")  # 已连接绿色
+            else:
+                color = QColor("#666B75")  # 未连接灰色
+            painter.setBrush(color)
+            painter.setPen(QColor("#1A1B1D"))
+            r = max(int(size * _TRAY_DOT_RADIUS_RATIO), 2)
+            painter.drawEllipse(size - 2 * r - 1, size - 2 * r - 1, 2 * r, 2 * r)
+            painter.end()
+            icon.addPixmap(pm)
+        return icon
 
     def set_connection_status(self, connected: bool) -> None:
         """更新连接状态。"""

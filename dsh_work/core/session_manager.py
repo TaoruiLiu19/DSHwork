@@ -564,20 +564,61 @@ class SessionManager:
         # 切换 WebSocket 流
         self.dsh.switch_session(session_id)
 
-        # 加载历史（懒加载）
+        # 加载历史（懒加载，异步：RPC 在主线程同步执行会阻塞 UI 100-250ms）
         if session_id not in self._sessions:
             self._sessions[session_id] = SessionState(
                 info=SessionInfo(id=session_id)
             )
         state = self._sessions[session_id]
         if not state.messages:
-            self._load_history(session_id, limit=C.SESSION_LAZY_LOAD_BATCH)
+            self._load_history_async(session_id, limit=C.SESSION_LAZY_LOAD_BATCH)
 
         self._notify(session_id)
         log.info("切换会话: %s → %s", old_id, session_id)
 
+    def _load_history_async(self, session_id: str, limit: int = 50) -> None:
+        """后台线程加载会话历史，避免 RPC 阻塞主线程。
+
+        RPC（session.history）实测耗时 70-250ms；若在主线程同步执行，
+        切换会话时 UI 会卡顿。这里放独立线程拉取 + 解析，完成后通过
+        跨线程桥接器回主线程更新 state 并通知 UI 渲染。
+        """
+        import threading
+
+        def _fetch():
+            try:
+                messages = self.dsh.get_history(session_id, limit=limit)
+            except Exception as e:
+                log.warning("加载会话历史失败 session=%s: %s", session_id, e)
+                messages = []
+            # 回主线程（若已有桥接器）
+            bridge = getattr(self, "_thread_bridge", None)
+            if bridge is not None:
+                bridge(session_id, messages)
+            else:
+                # 无桥接器时直接落盘（非 UI 场景，如离线恢复）
+                if session_id in self._sessions:
+                    st = self._sessions[session_id]
+                    st.messages = messages
+                    self._rebuild_ts_index(st)
+
+        t = threading.Thread(target=_fetch, name=f"dsh-history-{session_id[:8]}", daemon=True)
+        t.start()
+
+    def _on_history_fetched(self, session_id: str, messages: list) -> None:
+        """（主线程）历史拉取完成：更新 state 并通知 UI 渲染。"""
+        if session_id not in self._sessions:
+            return
+        state = self._sessions[session_id]
+        state.messages = messages
+        self._rebuild_ts_index(state)
+        # 只通知当前会话（避免渲染已切换走的旧会话历史）
+        if session_id == self._current_session_id:
+            state.last_event_type = "history_loaded"
+            self._notify(session_id)
+
     def _load_history(self, session_id: str, limit: int = 50) -> None:
-        """加载会话历史（懒加载）。"""
+        """加载会话历史（懒加载，同步版，离线/无桥接场景兜底）。"""
         try:
             messages = self.dsh.get_history(session_id, limit=limit)
             if session_id in self._sessions:

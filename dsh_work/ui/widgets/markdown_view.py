@@ -306,11 +306,31 @@ class MarkdownTextEdit(QTextBrowser):
         self._sync_height()
 
     def _apply_align(self) -> None:
-        """重渲后恢复文档对齐（setHtml 会重置 defaultTextOption）。"""
+        """重渲后恢复文档对齐（setHtml 会重置 defaultTextOption）。
+
+        注意：只设置 defaultTextOption 不够——已有文本块的对齐由各自
+        blockFormat 控制，defaultTextOption 仅影响新块。必须遍历所有
+        非空块 mergeBlockFormat(AlignRight)，否则右对齐不生效。
+        """
         if getattr(self, "_align_right", False):
-            opt = self.document().defaultTextOption()
+            from PySide6.QtGui import QTextBlockFormat, QTextCursor
+
+            doc = self.document()
+            opt = doc.defaultTextOption()
             opt.setAlignment(Qt.AlignmentFlag.AlignRight)
-            self.document().setDefaultTextOption(opt)
+            doc.setDefaultTextOption(opt)
+
+            cursor = QTextCursor(doc)
+            cursor.beginEditBlock()
+            block = doc.firstBlock()
+            while block.isValid():
+                if block.text().strip():
+                    fmt = QTextBlockFormat()
+                    fmt.setAlignment(Qt.AlignmentFlag.AlignRight)
+                    cursor.setPosition(block.position())
+                    cursor.mergeBlockFormat(fmt)
+                block = block.next()
+            cursor.endEditBlock()
 
     def append_plain(self, text: str) -> None:
         """流式增量：在文档末尾追加纯文本（不做 markdown 重排，性能快 100 倍）。
@@ -350,12 +370,13 @@ class MarkdownTextEdit(QTextBrowser):
     def _sync_height(self) -> None:
         """按视图当前渲染宽度重算内容高度并显式设置（防裁剪）。
 
-        注意：QTextBrowser 的 document.textWidth 由视图控制（跟随 viewport），
-        手动 setTextWidth 会被内部布局覆盖；这里直接对当前布局 adjustSize 后
-        读取 documentLayout().documentSize()，即真实渲染高度。
+        注意：不能调用 doc.adjustSize()——它会按内容 idealWidth 压缩
+        textWidth（例如 798px 视口被压成 128px），破坏全宽布局，导致
+        右对齐文本在压缩后的窄文档内对齐、视觉上仍靠左。
+        QTextBrowser 的 textWidth 由视图自动跟随 viewport 宽度，
+        documentLayout().documentSize() 即当前宽度下的真实渲染高度。
         """
         doc = self.document()
-        doc.adjustSize()
         h = int(doc.documentLayout().documentSize().height()) + 4
         h = max(h, 24)
         if h != self._cached_height:
@@ -364,12 +385,15 @@ class MarkdownTextEdit(QTextBrowser):
             self.updateGeometry()
 
     def heightForWidth(self, width: int) -> int:
-        """兜底：布局若咨询 heightForWidth 时返回内容高度。"""
+        """兜底：布局若咨询 heightForWidth 时返回内容高度。
+
+        同样不能 adjustSize()（会压缩 textWidth）；setTextWidth 后
+        直接读布局高度即可。
+        """
         if width <= 0:
             width = 400
         doc = self.document()
         doc.setTextWidth(width)
-        doc.adjustSize()
         return int(doc.documentLayout().documentSize().height()) + 4
 
     def sizeHint(self) -> Any:

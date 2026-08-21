@@ -1,15 +1,15 @@
 """对话列头部（对齐 DSH Web 版 Session Header）。
 
 Web 版对话列顶部是一个 session header：左侧会话标题，
-右侧视图 tabs 与操作。本组件承载：
+右侧视图 tabs。本组件承载：
 - 会话标题（ConversationTitle）
 - 视图切换按钮：对话 / 用量（HeaderBtn，选中态用主题 accent 下划线）
-- 新建会话按钮（+）
+
+新建会话入口统一在左侧栏（Sidebar 顶部「＋ 新建会话」），此处不重复。
 
 信号：
 - usage_requested(): 点击「用量」视图
 - conversation_requested(): 点击「对话」视图
-- new_session_requested(): 点击新建会话
 """
 
 from __future__ import annotations
@@ -23,11 +23,10 @@ log = get_logger("ui.conversation_header")
 
 
 class ConversationHeader(QWidget):
-    """对话列头部：会话标题 + 视图切换 + 新会话。"""
+    """对话列头部：会话标题 + 视图切换。"""
 
     usage_requested = Signal()
     conversation_requested = Signal()
-    new_session_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -59,13 +58,6 @@ class ConversationHeader(QWidget):
         self._view_usage = self._make_view_btn("用量", "usage")
         layout.addWidget(self._view_conversation)
         layout.addWidget(self._view_usage)
-
-        # 新建会话按钮（+）
-        self._new_btn = QPushButton("＋ 新建会话")
-        self._new_btn.setObjectName("HeaderBtn")
-        self._new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._new_btn.clicked.connect(self.new_session_requested)
-        layout.addWidget(self._new_btn)
 
         self.set_active_view("conversation")
 

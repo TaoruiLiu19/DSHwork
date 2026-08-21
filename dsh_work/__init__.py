@@ -6,5 +6,5 @@
 - DSH 通信层 (dsh_work.api)：HTTP/WebSocket 客户端 + 版本适配器
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 __app_name__ = "DSH Work"

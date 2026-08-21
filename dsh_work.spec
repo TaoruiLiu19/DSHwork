@@ -29,11 +29,14 @@ import os
 
 block_cipher = None
 
-# ===== 资源：内置主题 JSON =====
-# 保持 dsh_work/resources/themes 相对结构，供 get_builtin_themes_dir() 解析命中
+# ===== 资源：内置主题 JSON + 应用图标 =====
+# 保持 dsh_work/resources 相对结构，供 get_builtin_themes_dir()/get_builtin_icon_path() 解析命中
 datas = [
     (src, "dsh_work/resources/themes")
     for src in glob.glob("dsh_work/resources/themes/*.json")
+] + [
+    (src, "dsh_work/resources/icons")
+    for src in glob.glob("dsh_work/resources/icons/*")
 ]
 
 # ===== 隐藏导入 =====
@@ -108,7 +111,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon="resources/icons/app.ico",   # 暂无图标，后续可加
+    # 应用图标：DeepSeek Harness 黑色小鲸鱼（由 resources/icons/dsh_whale.svg 生成）
+    icon="dsh_work/resources/icons/dsh_whale.ico",
 )
 
 # ========== onedir 版：产出 dist\DSHWork\（用于 Inno Setup 安装程序打包）==========

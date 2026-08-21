@@ -67,6 +67,8 @@ class DshWorkApp:
         self.qt_app.setApplicationName(C.APP_NAME)
         self.qt_app.setOrganizationName(C.ORG_NAME)
         self.qt_app.setApplicationVersion(C.APP_VERSION)
+        # 应用图标：DeepSeek Harness 黑色小鲸鱼（窗口标题栏 / 任务栏 / 托盘）
+        self._setup_app_icon()
 
         # 确保目录存在
         ensure_dirs()
@@ -90,6 +92,26 @@ class DshWorkApp:
             self.qt_app.aboutToQuit.connect(self.cleanup)
         except Exception:
             pass
+
+    def _setup_app_icon(self) -> None:
+        """设置应用图标：DeepSeek Harness 黑色小鲸鱼。
+
+        图标来自 dsh-web-frontend 的 favicon.svg（DSH 官方鲸鱼图形），
+        Qt SVG 渲染器按浅色模式渲染为黑色。同时设置 QApplication 级
+        （任务栏/托盘/所有窗口）与窗口级图标。
+        """
+        try:
+            from PySide6.QtGui import QIcon
+
+            from .config import get_builtin_icon_path
+
+            # QIcon 不接受 pathlib.Path，必须转 str
+            icon = QIcon(str(get_builtin_icon_path()))
+            if icon.isNull():
+                return
+            self.qt_app.setWindowIcon(icon)
+        except Exception as e:
+            log.warning("设置应用图标失败(不致命): %s", e)
 
     def run(self) -> int:
         """启动应用主循环。"""

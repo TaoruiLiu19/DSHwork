@@ -16,7 +16,7 @@
 ; - PyInstaller onefile 模式：dist\DSHWork.exe 单文件，无需 _internal 目录
 
 #define MyAppName "DSH Work"
-#define MyAppVersion "0.6.0"
+#define MyAppVersion "0.7.0"
 #define MyAppPublisher "DSH Work"
 #define MyAppExeName "DSHWork.exe"
 #define MyAppURL "https://github.com/deepseek-ai/deepseek-harness"

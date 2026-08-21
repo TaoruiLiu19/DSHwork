@@ -1,12 +1,19 @@
+<div align="center">
+
+<img src="dsh_work/resources/icons/dsh_whale.svg" width="88" alt="DSH Work 鲸鱼图标" />
+
 # DSH Work
 
 > AI 原生桌面工作台 · 基于 [DSH (DeepSeek Harness)](https://github.com/deepseek-ai/deepseek-harness) 的 Work / Code 双模式原生客户端。
+
+</div>
 
 为不熟悉 WebUI 的用户提供**一键安装、开箱即用**的桌面体验：无需预装 Python / Node.js / npm，首次启动自动下载便携运行时并拉起 DSH。v0.4.0 起，界面布局、配色、对话渲染全面对齐 DSH WebUI（dsh-web-frontend 的 `--dsw-*` 设计 token）。
 
 - **技术栈**：Python 3.11+ · PySide6 6.6+ · requests · websockets · SQLite
 - **平台**：Windows（Inno Setup 安装包 │ PyInstaller 打包）
 - **协议**：Typert RPC（HTTP）+ 双 WebSocket 事件流
+- **图标**：DeepSeek Harness 黑色小鲸鱼（窗口 / 任务栏 / 系统托盘）
 
 ---
 
@@ -53,7 +60,7 @@
 - **对话渲染对齐 Web ChatView**：全宽消息行（非气泡）——用户消息右对齐、Assistant 左对齐；自研 Markdown 渲染器支持代码块（语言标签条）、表格、行内代码、标题、引用、列表
 - **对话逻辑对齐**：流式「思考中…/工具执行中…」状态提示、turn tail 统计（本轮输入/输出 tokens、费用）、工具调用折叠卡、会话状态点（running 蓝 / pending 琥珀 / done 绿）
 - **Composer 输入条对齐**：Enter / Ctrl+Enter 发送、Shift+Enter 换行；底行快捷键提示 + 模型座 + 发送↔停止按钮；上下文容量条颜色编码（<70% 蓝 / 70-90% 橙 / >90% 红）
-- 系统托盘 + 迷你浮窗：关闭即最小化到托盘，可选浮窗速览
+- 系统托盘 + 迷你浮窗：关闭即最小化到托盘（**托盘为黑色小鲸鱼图标**，右下角状态点：绿=已连接 / 灰=未连接 / 蓝=工作态），可选浮窗速览
 - DeepSeek 余额内联小部件：对话底部实时显示「本轮 ¥X · 余额 ¥Y」，双通道容错（DSH 代理 + 平台直连），5 分钟缓存，点击强制刷新，余额不足警示色
 
 **工程保障（v0.6.0 起）**
@@ -67,11 +74,11 @@
 
 ### 方式一：终端用户（推荐）
 
-下载 `DSHWork-Setup-0.6.0.exe`，双击安装即可，无需任何前置依赖。
+下载 `DSHWork-Setup-0.7.0.exe`，双击安装即可，无需任何前置依赖。
 
 - 安装目录：`%ProgramFiles%\DSHWork`
 - 用户数据：`%USERPROFILE%\.dsh-work\`（配置、主题、日志、便携运行时，卸载默认保留）
-- 静默安装：`DSHWork-Setup-0.6.0.exe /VERYSILENT /CURRENTUSER`
+- 静默安装：`DSHWork-Setup-0.7.0.exe /VERYSILENT /CURRENTUSER`
 
 ### 方式二：源码运行（开发者）
 
@@ -193,7 +200,7 @@ DSHWork/
 
 产物：
 - `dist\DSHWork\` — PyInstaller onedir 目录
-- `installer\Output\DSHWork-Setup-0.6.0.exe` — Windows 安装包（版本号自动读取自 `installer\dsh-work.iss`，与 `dsh_work/constants.py` 的 `APP_VERSION` 同步）
+- `installer\Output\DSHWork-Setup-0.7.0.exe` — Windows 安装包（版本号自动读取自 `installer\dsh-work.iss`，与 `dsh_work/constants.py` 的 `APP_VERSION` 同步）
 
 ---
 
@@ -213,6 +220,50 @@ DSHWork/
 ---
 
 ## 📋 更新日志
+
+### v0.7.0 — 鲸鱼图标 + 右侧栏网页版对齐 + 会话加载提速
+
+#### 界面与体验
+
+| 变更 | 说明 |
+|------|------|
+| 应用图标 | 窗口标题栏 / 任务栏 / 系统托盘统一为 **DeepSeek Harness 黑色小鲸鱼**（取自 dsh-web-frontend favicon）；托盘图标右下角保留状态点（绿=已连接 / 灰=未连接 / 蓝=工作态）；PyInstaller exe 图标同步更新 |
+| 附件上传修复 | 📎 附件按钮此前未连接点击处理（点击无反应），且附件从未随消息发出；现点击弹出文件选择对话框，图片作为附件随消息发送（DSH schema 仅支持图片附件），非图片保留路径文本；拖拽与点击选择统一去重上报 |
+| 右侧栏对齐网页版 Details | 折叠窄条（含 ◀ 展开按钮）↔ 展开内容（含 ✕ 收纳按钮）；切换会话自动收起；工具事件不强制展开（修复"只有展开没有收回"信号循环） |
+| 中栏去重复 | 对话列头部移除与左侧栏重复的「新建会话」按钮，新建入口统一在左侧栏 |
+| 用户消息右对齐 | 修复 blockFormat 逐块对齐 + textWidth 被 adjustSize 压缩两个隐藏 bug，用户消息内容真正右对齐 |
+| 浅色主题选中态 | 修复 `QColor("rgba(r,g,b,0.10)")` 解析失败导致侧栏选中会话黑底深字（新增 `_qcolor` 安全解析） |
+
+#### 性能
+
+| 变更 | 说明 |
+|------|------|
+| 会话历史异步加载 | `switch_to` 的 RPC 移到后台线程，切换会话不再卡顿（原 70-250ms 阻塞） |
+| 高级状态回放异步 | `read_full_record`（zstd 解压 5.7MB ≈ 670ms）移到后台线程，计划/审批条后台回放 |
+| 渲染 O(n²) 优化 | 消息批渲染合并布局更新，500 条历史 2639ms → 1107ms（↓58%） |
+| 修复 pyzstd 缺失 | `pyzstd` 加入依赖——此前高级状态回放静默失效（从未工作过） |
+
+#### 工程
+
+| 变更 | 说明 |
+|------|------|
+| 版本号统一 0.7.0 | constants / `__init__` / pyproject / installer 四源一致，CI 强制门禁 |
+| 单元测试扩展 | 新增图标 / 面板折叠 / 桥接器 / 会话异步加载 / 附件上传等测试，共 75 项 |
+
+#### 新增/修改文件
+
+```
+新增：
+dsh_work/resources/icons/dsh_whale.svg   # 鲸鱼图标（官方 favicon）
+dsh_work/resources/icons/dsh_whale.ico   # exe 图标（SVG 生成）
+dsh_work/resources/icons/whale_*.png     # 托盘多尺寸底图
+tests/test_icon.py / test_panels.py / test_bridge.py / test_session_loading.py / test_ui_fixes.py / test_attachment.py
+修改：
+dsh_work/app.py / config.py / system_tray.py / right_panel.py / main_window.py
+dsh_work/ui/widgets/{message_list,markdown_view,conversation_header,input_box}.py
+dsh_work/core/session_manager.py
+dsh_work.spec / pyproject.toml / installer/dsh-work.iss
+```
 
 ### v0.6.0 — CI/CD 流水线与单元测试门禁
 

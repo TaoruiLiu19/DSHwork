@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsh-work"
-version = "0.6.0"
+version = "0.7.0"
 description = "DSH Work — AI 原生桌面工作台，为 DSH (DeepSeek Harness) 提供 Work/Code 双模式原生体验"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,7 @@ dependencies = [
     "websockets>=12.0",
     "portalocker>=2.8.2",
     "PyYAML>=6.0",
+    "pyzstd>=0.16.0",
 ]
 
 [project.optional-dependencies]
@@ -36,7 +37,7 @@ where = ["."]
 include = ["dsh_work*"]
 
 [tool.setuptools.package-data]
-"dsh_work" = ["resources/themes/*.json", "resources/i18n/*.ts"]
+"dsh_work" = ["resources/themes/*.json", "resources/i18n/*.ts", "resources/icons/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

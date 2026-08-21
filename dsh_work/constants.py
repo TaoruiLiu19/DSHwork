@@ -7,7 +7,7 @@ from __future__ import annotations
 
 # ===== 应用元信息 =====
 APP_NAME = "DSH Work"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 ORG_NAME = "DSH Work"
 ORG_DOMAIN = "dsh.work"
 

@@ -84,6 +84,26 @@ def _is_dark_color(hex_or_rgba: str) -> bool:
         return True
 
 
+def _qcolor(value: str) -> QColor:
+    """把主题颜色字符串安全解析为 QColor。
+
+    主题 token 使用 CSS 风格 `rgba(r, g, b, 0.10)`（alpha 为 0-1 浮点），
+    而 Qt 的 QColor.setNamedColor 只接受 0-255 整数 alpha，直接传入会得到
+    无效颜色（渲染为黑色，浅色主题选中态会黑底深字看不清）。这里手动解析。
+    """
+    import re
+
+    if not value:
+        return QColor("#000000")
+    m = re.match(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+)\s*)?\)", value)
+    if m:
+        r, g, b = (int(m.group(i)) for i in (1, 2, 3))
+        a = m.group(4)
+        alpha = int(round(float(a) * 255)) if a else 255
+        return QColor(r, g, b, alpha)
+    return QColor(value)
+
+
 def _palette() -> dict:
     """读取当前主题配色，回退到暗色默认值。"""
     tc = _theme_colors()
@@ -146,7 +166,7 @@ class SessionItemDelegate(QStyledItemDelegate):
             f_h.setPointSize(8)
             f_h.setWeight(QFont.Weight.DemiBold)
             painter.setFont(f_h)
-            painter.setPen(QColor(p.get("muted", "#81858C")))
+            painter.setPen(_qcolor(p.get("muted", "#81858C")))
             h_rect = QRect(rect.left() + 14, rect.top(), rect.width() - 24, rect.height())
             painter.drawText(h_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
             painter.restore()
@@ -154,9 +174,9 @@ class SessionItemDelegate(QStyledItemDelegate):
 
         # 背景：选中 / 悬停
         if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(rect, QColor(p.get("active", "rgba(255,255,255,0.14)")))
+            painter.fillRect(rect, _qcolor(p.get("active", "rgba(255,255,255,0.14)")))
         elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(rect, QColor(p.get("hover", "rgba(255,255,255,0.08)")))
+            painter.fillRect(rect, _qcolor(p.get("hover", "rgba(255,255,255,0.08)")))
 
         # 状态点（左侧 12px 处，8px 圆）
         status = index.data(Qt.ItemDataRole.UserRole + 1) or "idle"
@@ -176,7 +196,7 @@ class SessionItemDelegate(QStyledItemDelegate):
         f_title.setPointSize(10)
         f_title.setWeight(QFont.Weight.DemiBold)
         painter.setFont(f_title)
-        painter.setPen(QColor(p.get("text", "#F9FAFB")))
+        painter.setPen(_qcolor(p.get("text", "#F9FAFB")))
         elided = painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, title_rect.width())
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
 
@@ -186,7 +206,7 @@ class SessionItemDelegate(QStyledItemDelegate):
             f_time = QFont(option.font)
             f_time.setPointSize(8)
             painter.setFont(f_time)
-            painter.setPen(QColor(p.get("muted", "#81858C")))
+            painter.setPen(_qcolor(p.get("muted", "#81858C")))
             painter.drawText(time_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, time_str)
 
         painter.restore()

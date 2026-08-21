@@ -85,6 +85,18 @@ def get_builtin_themes_dir() -> Path:
     return Path(__file__).parent / "resources" / "themes"
 
 
+def get_builtin_icon_path() -> Path:
+    """打包内置应用图标路径（resources/icons/dsh_whale.svg）。
+
+    与主题目录同机制：PyInstaller 打包后从 sys._MEIPASS 解析，
+    源码运行时用 __file__ 相对路径。
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "dsh_work" / "resources" / "icons" / "dsh_whale.svg"
+    return Path(__file__).parent / "resources" / "icons" / "dsh_whale.svg"
+
+
 @dataclass
 class UserConfig:
     """用户持久化配置。
@@ -102,9 +114,9 @@ class UserConfig:
     panel_ratios: dict[str, float] = field(
         default_factory=lambda: {"left": 0.18, "center": 0.58, "right": 0.24}
     )
-    # 面板折叠状态
+    # 面板折叠状态（右侧 Details 默认折叠窄条，对齐网页版）
     panel_collapsed: dict[str, bool] = field(
-        default_factory=lambda: {"left": False, "right": False}
+        default_factory=lambda: {"left": False, "right": True}
     )
     # 最近使用的模型
     last_model: str = ""

@@ -1,12 +1,19 @@
+<div align="center">
+
+<img src="dsh_work/resources/icons/dsh_whale.svg" width="88" alt="DSH Work whale icon" />
+
 # DSH Work
 
 > AI-native desktop workbench · A native Work / Code dual-mode client for [DSH (DeepSeek Harness)](https://github.com/deepseek-ai/deepseek-harness).
+
+</div>
 
 Built for users unfamiliar with the WebUI: **one-click install, works out of the box**. No need to preinstall Python / Node.js / npm — on first launch it automatically downloads a portable runtime and starts DSH. Since v0.4.0 the UI layout, colors, and conversation rendering are fully aligned with the DSH WebUI (the `--dsw-*` design tokens from dsh-web-frontend).
 
 - **Tech stack**: Python 3.11+ · PySide6 6.6+ · requests · websockets · SQLite
 - **Platform**: Windows (Inno Setup installer │ PyInstaller packaging)
 - **Protocol**: Typert RPC (HTTP) + dual WebSocket event streams
+- **Icon**: the DeepSeek Harness black whale (window / taskbar / system tray)
 
 ---
 
@@ -67,11 +74,11 @@ Built for users unfamiliar with the WebUI: **one-click install, works out of the
 
 ### Option 1: End users (recommended)
 
-Download `DSHWork-Setup-0.6.0.exe` and double-click to install. No prerequisites required.
+Download `DSHWork-Setup-0.7.0.exe` and double-click to install. No prerequisites required.
 
 - Install directory: `%ProgramFiles%\DSHWork`
 - User data: `%USERPROFILE%\.dsh-work\` (config, themes, logs, portable runtime; kept on uninstall by default)
-- Silent install: `DSHWork-Setup-0.6.0.exe /VERYSILENT /CURRENTUSER`
+- Silent install: `DSHWork-Setup-0.7.0.exe /VERYSILENT /CURRENTUSER`
 
 ### Option 2: Run from source (developers)
 
@@ -193,7 +200,7 @@ Prerequisites: Python 3.11+, [Inno Setup 6](https://jrsoftware.org/isdl.php)
 
 Artifacts:
 - `dist\DSHWork\` — PyInstaller onedir directory
-- `installer\Output\DSHWork-Setup-0.6.0.exe` — Windows installer (version is read from `installer\dsh-work.iss`, kept in sync with `APP_VERSION` in `dsh_work/constants.py`)
+- `installer\Output\DSHWork-Setup-0.7.0.exe` — Windows installer (version is read from `installer\dsh-work.iss`, kept in sync with `APP_VERSION` in `dsh_work/constants.py`)
 
 ---
 
@@ -213,6 +220,50 @@ Logs: `<project root>/logs/` (size-rotated, 7 files kept); a diagnostics bundle 
 ---
 
 ## 📋 Changelog
+
+### v0.7.0 — Whale icon + web-aligned details panel + faster session loading
+
+#### UI & experience
+
+| Change | Description |
+|--------|-------------|
+| App icon | Window title bar / taskbar / system tray now use the **DeepSeek Harness black whale** (from dsh-web-frontend favicon); tray keeps a status dot (green=connected / gray=disconnected / blue=running); PyInstaller exe icon updated |
+| Attachment upload fixed | The 📎 button previously had no click handler (clicking did nothing) and attachments never traveled with the message; now it opens a file picker, images are sent as attachments (the DSH schema only supports image attachments), non-images keep their path text; drag-and-drop and picker paths are deduplicated |
+| Right panel aligned with web Details | Collapsible rail (with ◀ expand button) ↔ expanded content (with ✕ collapse button); auto-collapse on session switch; tool events no longer force-expand (fixed the "expand-only" signal loop) |
+| Removed duplicate new-session button | Conversation header no longer duplicates the sidebar's "New session" button |
+| User message right-alignment | Fixed two hidden bugs (per-block blockFormat alignment + textWidth shrunk by adjustSize); user messages are truly right-aligned now |
+| Light-theme selection state | Fixed `QColor("rgba(r,g,b,0.10)")` parse failure that made selected sessions black-on-dark (added safe `_qcolor` parser) |
+
+#### Performance
+
+| Change | Description |
+|--------|-------------|
+| Async session history | `switch_to` RPC moved to a background thread; session switching no longer blocks (was 70–250ms) |
+| Async advanced-state replay | `read_full_record` (zstd decompress of a 5.7MB log ≈ 670ms) moved off the UI thread; todos/approval bars replay in background |
+| Rendering O(n²) fix | Batch rendering now coalesces layout updates; 500 messages 2639ms → 1107ms (↓58%) |
+| Fixed missing pyzstd | `pyzstd` added to dependencies — advanced-state replay was silently broken before |
+
+#### Engineering
+
+| Change | Description |
+|--------|-------------|
+| Version unified to 0.7.0 | constants / `__init__` / pyproject / installer in sync, enforced by CI |
+| Test suite extended | Icon / panel collapse / bridge / async session loading / attachment upload tests added — 75 total |
+
+#### Added/modified files
+
+```
+Added:
+dsh_work/resources/icons/dsh_whale.svg   # whale icon (official favicon)
+dsh_work/resources/icons/dsh_whale.ico   # exe icon (generated from SVG)
+dsh_work/resources/icons/whale_*.png     # tray multi-size bases
+tests/test_icon.py / test_panels.py / test_bridge.py / test_session_loading.py / test_ui_fixes.py / test_attachment.py
+Modified:
+dsh_work/app.py / config.py / system_tray.py / right_panel.py / main_window.py
+dsh_work/ui/widgets/{message_list,markdown_view,conversation_header,input_box}.py
+dsh_work/core/session_manager.py
+dsh_work.spec / pyproject.toml / installer/dsh-work.iss
+```
 
 ### v0.6.0 — CI/CD pipeline and unit-test gate
 

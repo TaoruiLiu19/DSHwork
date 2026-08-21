@@ -201,7 +201,6 @@ class MainWindow(QMainWindow):
         self.center_panel.conversation_requested.connect(
             lambda: self._center_stack.setCurrentWidget(self.center_panel)
         )
-        self.center_panel.new_session_requested.connect(self._action_new_session)
         # 用量面板返回按钮 → 回到对话（并复位头部高亮）
         self.usage_panel.back_requested.connect(self._back_to_conversation)
 
@@ -256,8 +255,8 @@ class MainWindow(QMainWindow):
         self.left_panel.session_rename_requested.connect(self._on_session_rename)
         self.left_panel.close_requested.connect(lambda: self._toggle_panel("left"))
 
-        # 右栏：关闭面板
-        self.right_panel.close_requested.connect(lambda: self._toggle_panel("right"))
+        # 右栏：用户点击 ✕ 收纳（专用处理：折叠 + 保存，不走 toggle 避免信号循环）
+        self.right_panel.close_requested.connect(self._on_right_panel_close_requested)
 
         # 模式管理器（兼容旧逻辑：preset→mode 映射后走 mode_manager 分发）
         self.mode_manager.add_listener(self._on_mode_state_changed)
@@ -265,6 +264,14 @@ class MainWindow(QMainWindow):
         # 会话管理器（使用跨线程桥接器，因为 WebSocket 回调在独立线程执行）
         self._session_event_bridge = _MainThreadBridge(self._on_session_changed, self)
         self.session_manager.add_listener(self._session_event_bridge)
+        # 历史异步加载：后台线程拉 RPC 完成后经桥接器回主线程更新 + 渲染
+        # 注意：bridge 的 parent 必须是 QObject（这里用主窗口自身），
+        # SessionManager 不是 QObject，不能作为 parent。
+        self.session_manager._thread_bridge = _MainThreadBridge(
+            self.session_manager._on_history_fetched, self
+        )
+        # 高级状态回放（zstd 解压）异步化：后台线程 → 桥接器 → 主线程更新 UI
+        self._replay_bridge = _MainThreadBridge(self._on_replay_done, self)
 
         # 系统托盘
         self.system_tray.new_session_requested.connect(self._action_new_session)
@@ -289,8 +296,18 @@ class MainWindow(QMainWindow):
         # 面板折叠状态
         if self.config.panel_collapsed.get("left"):
             self.left_panel.setVisible(False)
+        # 右侧 Details：默认折叠窄条（保留 rail 展开入口）；配置 true 表示折叠
         if self.config.panel_collapsed.get("right"):
-            self.right_panel.setVisible(False)
+            self.right_panel.collapse()
+        else:
+            self.right_panel.expand()
+            # 展开时给 Details 默认宽度（对齐网页版 DETAILS_DEFAULT=360）
+            sizes = self._splitter.sizes()
+            if len(sizes) == 3:
+                total = sum(sizes) or 1
+                self._splitter.setSizes([
+                    sizes[0], max(total - sizes[0] - 360, 200), 360,
+                ])
 
         # 系统托盘
         if self.config.minimize_to_tray:
@@ -344,31 +361,59 @@ class MainWindow(QMainWindow):
             log.debug("会话列表静默同步失败(不致命): %s", e)
 
     def _replay_advanced_state(self, session_id: str) -> None:
-        """切换会话后：从 session.jsonl.zstd 回放高级交互状态（计划/审批）。"""
+        """切换会话后：从 session.jsonl.zstd 回放高级交互状态（计划/审批）。
+
+        性能优化：read_full_record 需解压整个 zstd 文件（实测 5.7MB 约
+        670ms），放后台线程执行，完成后经桥接器回主线程更新 UI，避免
+        切换会话时主线程卡顿。
+        """
         if self.dsh is None or self.dsh.is_offline:
             return
-        try:
-            from ..core.session_log import latest_todos, read_full_record
-            rec = read_full_record(session_id)
-            # 计划条回放（Web 版 TodoDock：最新 todo/write 且其后无 turn/start）
-            todos = latest_todos(rec)
-            self.center_panel.set_todos(todos)
-            # 审批回放：最后的 approval/asked 若无对应 decided → 展示审批条
-            pending = None
-            asked_id = None
-            for a in rec.approvals:
-                if a.get("id"):
-                    asked_id = a.get("id")
-                if "outcome" in a:
-                    asked_id = None
-            if asked_id:
+        import threading
+
+        def _work():
+            try:
+                from ..core.session_log import latest_todos, read_full_record
+                rec = read_full_record(session_id)
+                todos = latest_todos(rec)
+                # 审批回放：最后的 approval/asked 若无对应 decided → 展示审批条
+                pending = None
+                asked_id = None
                 for a in rec.approvals:
-                    if a.get("id") == asked_id and "outcome" not in a:
-                        pending = a
-                        break
+                    if a.get("id"):
+                        asked_id = a.get("id")
+                    if "outcome" in a:
+                        asked_id = None
+                if asked_id:
+                    for a in rec.approvals:
+                        if a.get("id") == asked_id and "outcome" not in a:
+                            pending = a
+                            break
+                result = (todos, pending)
+            except Exception as e:
+                log.debug("高级状态回放失败(不致命): %s", e)
+                result = (None, None)
+
+            bridge = getattr(self, "_replay_bridge", None)
+            if bridge is not None:
+                bridge(session_id, result)
+
+        t = threading.Thread(target=_work, name="dsh-replay", daemon=True)
+        t.start()
+
+    def _on_replay_done(self, session_id: str, result: tuple) -> None:
+        """（主线程）高级状态回放完成：更新计划条与审批条。
+
+        会话已切换走时忽略（避免旧会话状态污染新会话 UI）。
+        """
+        if session_id != self.session_manager.current_session_id:
+            return
+        try:
+            todos, pending = result
+            self.center_panel.set_todos(todos)
             self.center_panel.show_approval(pending)
         except Exception as e:
-            log.debug("高级状态回放失败(不致命): %s", e)
+            log.debug("高级状态回放 UI 更新失败(不致命): %s", e)
 
     @staticmethod
     def _mode_to_preset(mode: str) -> str:
@@ -512,6 +557,9 @@ class MainWindow(QMainWindow):
         if session_id == self.session_manager.current_session_id:
             return
         self.session_manager.switch_to(session_id)
+        # 切换会话：自动折叠右侧 Details 到窄条（对齐网页版 closeDetails，
+        # 但保留 rail 展开入口）
+        self.right_panel.collapse()
         # 切换后渲染历史消息
         state = self.session_manager.current_session
         if state:
@@ -519,11 +567,12 @@ class MainWindow(QMainWindow):
             self.center_panel.set_session_title(state.info.title or "新对话")
             # StatsDock 统计条（Web 版 sessionStats）
             self.center_panel.set_session_stats(getattr(state.info, "projections", None) or {})
-            # 高级交互历史回放（计划/审批，异步避免卡 UI）
-            QTimer.singleShot(0, lambda sid=session_id: self._replay_advanced_state(sid))
+            # 高级交互历史回放（计划/审批，内部已异步到后台线程）
+            self._replay_advanced_state(session_id)
             if state.messages:
                 self.center_panel.load_history(state.messages)
             else:
+                # 历史尚未到达（异步加载中）：先清空，避免残留上个会话的消息
                 self.center_panel.clear_messages()
             # 同步状态栏
             self._on_session_changed(session_id, state)
@@ -575,12 +624,18 @@ class MainWindow(QMainWindow):
             log.warning("安全围栏：拦截文件预览 %s (roots=%s)", file_path, roots)
             return
 
-        # 确保右栏可见
-        if not self.right_panel.isVisible():
-            self.right_panel.setVisible(True)
-            self.config.panel_collapsed["right"] = False
-            self.config.save()
+        # 预览文件（RightPanel.preview_file 内部自动展开详情面板）
         self.right_panel.preview_file(file_path)
+        # 展开时给 Details 默认宽度（对齐网页版 DETAILS_DEFAULT=360）
+        if not self.right_panel.is_collapsed():
+            sizes = self._splitter.sizes()
+            if len(sizes) == 3:
+                total = sum(sizes) or 1
+                self._splitter.setSizes([
+                    sizes[0], max(total - sizes[0] - 360, 200), 360,
+                ])
+        self.config.panel_collapsed["right"] = self.right_panel.is_collapsed()
+        self.config.save()
         log.debug("预览文件: %s", file_path)
 
     def _on_files_dropped(self, files: list) -> None:
@@ -822,6 +877,10 @@ class MainWindow(QMainWindow):
                 f"⚠️ {err_msg}", color="#F65A5A", duration_ms=5000
             )
 
+        elif event_type == "history_loaded":
+            # 异步历史加载完成：渲染消息流
+            self.center_panel.load_history(state.messages)
+
         elif event_type == "history_sync":
             # 重连增量恢复：重载消息流（断线期间错过的消息已合并到 state.messages）
             self.center_panel.load_history(state.messages)
@@ -1003,16 +1062,37 @@ class MainWindow(QMainWindow):
     def _toggle_right_panel(self) -> None:
         self._toggle_panel("right")
 
+    def _on_right_panel_close_requested(self) -> None:
+        """用户点击 ✕ 收纳 Details：折叠 + 保存配置。
+
+        注意：不能走 _toggle_panel（会 toggle 回来）——RightPanel 的
+        collapse 已在此前完成，这里只负责折叠回窄条并持久化。
+        """
+        self.right_panel.collapse()
+        self.config.panel_collapsed["right"] = True
+        self.config.save()
+
     def _toggle_panel(self, side: str) -> None:
-        """切换左/右面板可见性（纯净界面模式）。"""
+        """切换左/右面板可见性（纯净界面模式）。
+
+        左侧：显示/隐藏；右侧：关闭/展开 Details（对齐网页版 openDetails/closeDetails）。
+        """
         if side == "left":
             visible = not self.left_panel.isVisible()
             self.left_panel.setVisible(visible)
             self.config.panel_collapsed["left"] = not visible
         else:
-            visible = not self.right_panel.isVisible()
-            self.right_panel.setVisible(visible)
-            self.config.panel_collapsed["right"] = not visible
+            was_collapsed = self.right_panel.is_collapsed()
+            self.right_panel.toggle()
+            # 展开时给 Details 默认宽度（对齐网页版 DETAILS_DEFAULT=360）
+            if was_collapsed and not self.right_panel.is_collapsed():
+                sizes = self._splitter.sizes()
+                if len(sizes) == 3:
+                    total = sum(sizes) or 1
+                    self._splitter.setSizes([
+                        sizes[0], max(total - sizes[0] - 360, 200), 360,
+                    ])
+            self.config.panel_collapsed["right"] = self.right_panel.is_collapsed()
         self.config.save()
 
     def _on_splitter_moved(self, pos: int, index: int) -> None:

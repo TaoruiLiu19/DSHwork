@@ -64,7 +64,6 @@ class CenterPanel(QWidget):
     balance_refresh_requested = Signal()  # 用户点击余额小部件触发强制刷新
     usage_requested = Signal()  # 点击「用量」视图
     conversation_requested = Signal()  # 点击「对话」视图
-    new_session_requested = Signal()  # header 新建会话按钮
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -81,11 +80,10 @@ class CenterPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ===== 对话列头部（会话标题 + 视图切换 + 新建） =====
+        # ===== 对话列头部（会话标题 + 视图切换；新建入口在左侧栏） =====
         self._header = ConversationHeader()
         self._header.usage_requested.connect(self.usage_requested)
         self._header.conversation_requested.connect(self.conversation_requested)
-        self._header.new_session_requested.connect(self.new_session_requested)
         layout.addWidget(self._header)
 
         # ===== 堆叠：空状态 / 消息流 =====

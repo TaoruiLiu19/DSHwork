@@ -188,6 +188,8 @@ class InputBox(QWidget):
         self._placeholder_code = "输入指令或粘贴代码..."
         self._current_placeholder = self._placeholder_work
         self._attached_files: list[str] = []
+        # 已通过 files_dropped 上报过的路径（避免拖拽即时上报 + 发送再上报重复）
+        self._reported_files: set[str] = set()
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -324,8 +326,9 @@ class InputBox(QWidget):
         self._attach_btn = QPushButton("📎")
         self._attach_btn.setFixedSize(28, 28)
         self._attach_btn.setObjectName("ComposerToolBtn")
-        self._attach_btn.setToolTip("拖拽文件到输入框，或点击选择文件")
+        self._attach_btn.setToolTip("点击选择要附加的文件（图片将随消息发送）")
         self._attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._attach_btn.clicked.connect(self._on_attach_clicked)
         bottom_bar.addWidget(self._attach_btn)
 
         # 快捷键提示（Web 版 placeholder 广告位）
@@ -405,9 +408,15 @@ class InputBox(QWidget):
 
         text = self._text_edit.toPlainText().strip()
         if text:
+            # 上报本次未上报过的附件（点击 📎 收集的；拖拽已在 dropEvent 即时上报）
+            new_files = [f for f in self._attached_files if f not in self._reported_files]
+            if new_files:
+                self.files_dropped.emit(new_files)
+                self._reported_files.update(new_files)
             self.send_requested.emit(text)
             self._text_edit.clear()
             self._attached_files.clear()
+            self._reported_files.clear()
             self._update_attach_label()
 
     def set_agent_status(self, status: AgentStatus) -> None:
@@ -506,6 +515,7 @@ class InputBox(QWidget):
         paths = [url.toLocalFile() for url in urls if url.isLocalFile()]
         if paths:
             self.files_dropped.emit(paths)
+            self._reported_files.update(paths)
             self._attached_files.extend(paths)
             self._update_attach_label()
             # 将文件路径插入到文本中
@@ -525,6 +535,35 @@ class InputBox(QWidget):
         else:
             self._attach_label.setVisible(False)
 
+    def _on_attach_clicked(self) -> None:
+        """点击 📎：打开文件选择对话框（多选），路径暂存为附件。
+
+        当前 DSH schema 仅支持图片附件随消息发送：
+        - 图片：作为附件（发送时走 image 内容块），不插入路径文本
+        - 其它文件：路径插入文本（发送时会被过滤忽略，仅文本可见）
+        """
+        from PySide6.QtWidgets import QFileDialog
+
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择要附加的文件",
+            "",
+            "图片文件 (*.png *.jpg *.jpeg *.webp *.gif);;所有文件 (*)",
+        )
+        if not paths:
+            return
+        self._attached_files.extend(paths)
+        self._update_attach_label()
+        # 仅非图片文件路径插入文本（图片作为附件单独发送，避免路径文本重复）
+        img_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+        non_images = [p for p in paths if not p.lower().endswith(tuple(img_exts))]
+        if non_images:
+            current = self._text_edit.toPlainText()
+            for p in non_images:
+                if current:
+                    current += "\n"
+                current += p
+            self._text_edit.setPlainText(current)
     def fill_prompt(self, text: str) -> None:
         """填充提示词到输入框（空状态卡片点击时调用）。"""
         self._text_edit.setPlainText(text)
