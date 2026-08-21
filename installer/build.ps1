@@ -39,8 +39,9 @@ Write-Step "确认 pyinstaller 已安装"
 Write-Step "PyInstaller 打包 dsh_work.spec（onefile 模式）"
 $env:PYTHONDONTWRITEBYTECODE = "1"   # 避免向系统 Python 的 __pycache__ 写临时 pyc（沙箱/权限受限时必需）
 if ($DebugConsole) { $env:DSHWORK_DEBUG_CONSOLE = "1" }
-$pyi = Join-Path $venv "Scripts\pyinstaller.exe"
-& $pyi dsh_work.spec --noconfirm --log-level WARN
+# 用 `python -m PyInstaller` 模块方式调用：CI 全新环境中 venv 用 --system-site-packages
+# 继承系统已装的 pyinstaller 时，venv 里可能没有 Scripts\pyinstaller.exe，模块方式不受影响。
+& $py -m PyInstaller dsh_work.spec --noconfirm --log-level WARN
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败 (rc=$LASTEXITCODE)" }
 
 $exe = Join-Path $root "dist\DSHWork.exe"
