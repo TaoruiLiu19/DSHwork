@@ -1,31 +1,35 @@
-"""左栏：二级面板（TRAE Work 风格，由 ActivityBar 导航控制）。
+"""左栏：Web 版 Sidebar（对齐 DSH Web UI 侧边栏）。
 
-四个视图页面，由 ActivityBar 的 nav_changed 信号切换：
-- sessions: 会话/任务列表 + 文档大纲
+四个视图页面（顶部导航按钮切换，替代旧的 ActivityBar）：
+- sessions: 会话列表（含状态点：running 蓝 / pending 琥珀 / done 绿）
 - files: 文件树
-- search: 搜索（预留）
+- search: 搜索
 - git: Git 面板
+底部固定「设置」入口（sidebar.settings 座）。
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from pathlib import Path
+
+from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QPushButton,
+    QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
     QTreeWidget,
     QTreeWidgetItem,
     QTreeWidgetItemIterator,
-    QStackedWidget,
-    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
-
-from ... import constants as C
 
 
 def _theme_colors():
@@ -54,16 +58,38 @@ _FALLBACK = {
     "text_mute": "#666B75",
     "border": "#B5BDC5",
     "bg_hover": "#B5BDC5",
+    "bg_active": "#B5BDC5",
     "input_bg": "#B5BDC5",
     "input_border": "#B5BDC5",
     "border_light": "#B5BDC5",
+    "accent": "#679EFE",
+    "brand": "#F9FAFB",
+    "on_brand": "#151517",
+    "brand_hover": "#CFD3D6",
 }
+
+
+def _is_dark_color(hex_or_rgba: str) -> bool:
+    """粗略判断一个颜色串是深色还是浅色（用于算品牌按钮上的文字对比色）。"""
+    try:
+        import re
+        m = re.match(r"rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)", hex_or_rgba)
+        if m:
+            r, g, b = (int(x) for x in m.groups())
+        else:
+            s = hex_or_rgba.lstrip("#")
+            r, g, b = (int(s[i:i + 2], 16) for i in (0, 2, 4))
+        return (0.299 * r + 0.587 * g + 0.114 * b) < 128
+    except Exception:
+        return True
 
 
 def _palette() -> dict:
     """读取当前主题配色，回退到暗色默认值。"""
     tc = _theme_colors()
     if tc:
+        brand = tc.brand_primary or _FALLBACK["brand"]
+        on_brand = "#F9FAFB" if _is_dark_color(brand) else "#151517"
         return {
             "bg": tc.bg_primary or _FALLBACK["bg"],
             "text": tc.text_primary or _FALLBACK["text"],
@@ -71,15 +97,106 @@ def _palette() -> dict:
             "text_mute": tc.text_muted or _FALLBACK["text_mute"],
             "border": tc.border or _FALLBACK["border"],
             "bg_hover": tc.bg_hover or _FALLBACK["bg_hover"],
+            "bg_active": tc.bg_active or _FALLBACK["bg_active"],
             "input_bg": tc.input_bg or _FALLBACK["input_bg"],
             "input_border": tc.input_border or _FALLBACK["input_border"],
             "border_light": tc.border_light or _FALLBACK["border_light"],
+            "accent": tc.accent or _FALLBACK["accent"],
+            "brand": brand,
+            "on_brand": on_brand,
+            "brand_hover": tc.text_secondary or _FALLBACK["brand_hover"],
         }
     return dict(_FALLBACK)
 
 
+class SessionItemDelegate(QStyledItemDelegate):
+    """会话行渲染器（对齐 Web 版会话行：状态点 + 标题 + 相对时间）。
+
+    行内结构：
+        ● 会话标题
+          3 分钟前
+    状态点颜色：running=accent蓝 / pending=琥珀 / done=绿 / idle=透明。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.dot_colors = {
+            "running": "#679EFE",
+            "pending": "#F59E0B",
+            "done": "#22C55E",
+        }
+        self._palette_ctx = {}
+
+    def set_palette_ctx(self, ctx: dict) -> None:
+        """由外层 apply_theme 注入当前主题色。"""
+        self._palette_ctx = ctx or {}
+
+    def paint(self, painter, option, index) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = option.rect
+        p = self._palette_ctx
+
+        # 工作区组标题（UserRole+3 == "header"）
+        if index.data(Qt.ItemDataRole.UserRole + 3) == "header":
+            painter.fillRect(rect, QColor("transparent"))
+            text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+            f_h = QFont(option.font)
+            f_h.setPointSize(8)
+            f_h.setWeight(QFont.Weight.DemiBold)
+            painter.setFont(f_h)
+            painter.setPen(QColor(p.get("muted", "#81858C")))
+            h_rect = QRect(rect.left() + 14, rect.top(), rect.width() - 24, rect.height())
+            painter.drawText(h_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+            painter.restore()
+            return
+
+        # 背景：选中 / 悬停
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, QColor(p.get("active", "rgba(255,255,255,0.14)")))
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(rect, QColor(p.get("hover", "rgba(255,255,255,0.08)")))
+
+        # 状态点（左侧 12px 处，8px 圆）
+        status = index.data(Qt.ItemDataRole.UserRole + 1) or "idle"
+        color = self.dot_colors.get(status, "transparent")
+        dot_x = rect.left() + 14
+        dot_y = rect.top() + 12
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(dot_x - 4, dot_y - 4, 8, 8)
+
+        # 标题（状态点右侧）
+        title = index.data(Qt.ItemDataRole.DisplayRole) or "新对话"
+        time_str = index.data(Qt.ItemDataRole.UserRole + 2) or ""
+        text_x = rect.left() + 26
+        title_rect = QRect(text_x, rect.top() + 6, rect.width() - text_x - 10, 18)
+        f_title = QFont(option.font)
+        f_title.setPointSize(10)
+        f_title.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(f_title)
+        painter.setPen(QColor(p.get("text", "#F9FAFB")))
+        elided = painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, title_rect.width())
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided)
+
+        # 时间（muted 色）
+        if time_str:
+            time_rect = QRect(text_x, rect.top() + 24, rect.width() - text_x - 10, 16)
+            f_time = QFont(option.font)
+            f_time.setPointSize(8)
+            painter.setFont(f_time)
+            painter.setPen(QColor(p.get("muted", "#81858C")))
+            painter.drawText(time_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, time_str)
+
+        painter.restore()
+
+    def sizeHint(self, option, index) -> QSize:
+        return QSize(super().sizeHint(option, index).width(), 46)
+
+
 class TaskListWidget(QListWidget):
-    """会话/任务列表（DSH Web UI 风格：简洁、无多余信息）。"""
+    """会话/任务列表（Web 版风格：状态点 + 标题 + 相对时间）。"""
 
     session_selected = Signal(str)  # session_id
     session_delete_requested = Signal(str)  # session_id
@@ -87,44 +204,85 @@ class TaskListWidget(QListWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        self._delegate = SessionItemDelegate(self)
+        self.setItemDelegate(self._delegate)
         self.setAlternatingRowColors(False)
+        self.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
         self.apply_theme()
 
     def apply_theme(self, theme=None) -> None:
-        """刷新样式表为当前主题配色。"""
+        """刷新样式表与 delegate 配色为当前主题。"""
         p = _palette()
+        self._delegate.set_palette_ctx({
+            "text": p["text"],
+            "muted": p["text_mute"],
+            "hover": p["bg_hover"],
+            "active": p["bg_active"],
+        })
         self.setStyleSheet(
             "QListWidget {"
             "  background-color: transparent;"
             "  border: none;"
             f"  color: {p['text']};"
             "}"
-            "QListWidget::item {"
-            "  padding: 8px 12px;"
-            "  border-radius: 6px;"
-            "  margin: 1px 4px;"
-            f"  color: {p['text']};"
-            "}"
-            "QListWidget::item:hover {"
-            f"  background-color: {p['bg_hover']};"
-            "}"
-            "QListWidget::item:selected {"
-            "  background-color: rgba(120, 119, 198, 0.15);"
-            f"  color: {p['text']};"
-            "}"
         )
 
-    def refresh(self, sessions: list) -> None:
+    def refresh(self, sessions: list, status_map: dict | None = None) -> None:
+        """刷新会话列表（按工作区分组，对齐 Web 版 Workspace 分组）。
+
+        Args:
+            sessions: SessionInfo 列表
+            status_map: {session_id: "running"|"pending"|"done"|"idle"}
+        """
         self.clear()
+        status_map = status_map or {}
+
+        # 按 cwd 工作区分组（cwd 为空 → 归入"未分组"）
+        groups: dict[str, list] = {}
         for session in sessions:
-            title = session.title or "新对话"
-            time_str = _format_relative_time(session.updated_at or session.created_at)
-            item_text = f"{title}\n{time_str}"
-            item = QListWidgetItem(item_text)
-            item.setData(Qt.ItemDataRole.UserRole, session.id)
-            self.addItem(item)
+            key = session.cwd or ""
+            groups.setdefault(key, []).append(session)
+
+        # 组排序：按组内最新会话的 updated_at 倒序（最近活跃在前）
+        ordered_groups = sorted(
+            groups.items(),
+            key=lambda kv: -(kv[1][0].updated_at or kv[1][0].created_at or 0),
+        )
+
+        for key, group in ordered_groups:
+            if key:
+                self._add_group_header(key)
+            # 组内会话按 updated_at 倒序
+            group.sort(key=lambda s: -(s.updated_at or s.created_at or 0))
+            for session in group:
+                self._add_session_item(session, status_map)
+
+    def _add_group_header(self, cwd: str) -> None:
+        """插入工作区组标题（不可选中，delegate 画小字 muted 样式）。"""
+        from pathlib import Path
+        try:
+            name = Path(cwd).name or cwd
+        except Exception:
+            name = cwd
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole + 3, "header")  # 标记为组标题
+        item.setData(Qt.ItemDataRole.DisplayRole, name)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)  # 不可选/不可点击
+        item.setSizeHint(QSize(0, 26))
+        self.addItem(item)
+
+    def _add_session_item(self, session, status_map: dict) -> None:
+        """插入单个会话项。"""
+        title = session.title or "新对话"
+        time_str = _format_relative_time(session.updated_at or session.created_at)
+        item = QListWidgetItem(title)
+        item.setData(Qt.ItemDataRole.UserRole, session.id)
+        item.setData(Qt.ItemDataRole.UserRole + 1, status_map.get(session.id, "idle"))
+        item.setData(Qt.ItemDataRole.UserRole + 2, time_str)
+        item.setSizeHint(QSize(0, 46))
+        self.addItem(item)
 
     def on_item_clicked(self, item: QListWidgetItem) -> None:
         session_id = item.data(Qt.ItemDataRole.UserRole)
@@ -205,7 +363,7 @@ class FileTreeWidget(QTreeWidget):
             "}"
         )
         # 调色板兜底：WindowText 决定 QTreeWidgetItem 默认文字色
-        from PySide6.QtGui import QPalette, QColor
+        from PySide6.QtGui import QColor, QPalette
         pal = self.palette()
         pal.setColor(QPalette.ColorRole.Text, QColor(p["text"]))
         pal.setColor(QPalette.ColorRole.WindowText, QColor(p["text"]))
@@ -349,12 +507,14 @@ def _section_label(text: str) -> QLabel:
 
 
 class LeftPanel(QWidget):
-    """二级面板：由 ActivityBar 导航控制显示内容。
+    """Web 版 Sidebar：顶部导航 + 会话/文件树/搜索/Git + 底部设置。
 
     信号：
         session_selected(str): 会话点击
         file_activated(str): 文件双击
         new_session_requested(): 新建会话
+        nav_requested(str): 顶部导航点击（sessions/files/search/git）
+        settings_requested(): 底部设置点击
         close_requested(): 请求关闭面板（纯净界面模式）
     """
 
@@ -363,11 +523,14 @@ class LeftPanel(QWidget):
     session_rename_requested = Signal(str)
     file_activated = Signal(str)
     new_session_requested = Signal()
+    nav_requested = Signal(str)
+    settings_requested = Signal()
     close_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setObjectName("LeftPanel")
+        self.setObjectName("WebSidebar")
+        self.setMinimumWidth(220)
         self._section_labels: list[QLabel] = []
         self._setup_ui()
         self.apply_theme()
@@ -383,11 +546,62 @@ class LeftPanel(QWidget):
         """刷新本面板及所有子组件的样式为当前主题配色。"""
         p = _palette()
         self.setStyleSheet(
-            "QWidget#LeftPanel {"
+            "QWidget#WebSidebar {"
             f"  background-color: {p['bg']};"
             f"  border-right: 1px solid {p['border']};"
             "}"
         )
+        # 顶部导航按钮
+        nav_style = (
+            "QPushButton {"
+            "  background-color: transparent;"
+            "  border: none;"
+            "  border-radius: 6px;"
+            f"  color: {p['text_mute']};"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover {"
+            f"  background-color: {p['bg_hover']};"
+            f"  color: {p['text']};"
+            "}"
+            f"QPushButton:checked {{ color: {p['accent']}; font-weight: 600; }}"
+        )
+        for btn in getattr(self, "_nav_btns", {}).values():
+            btn.setStyleSheet(nav_style)
+        # 新建会话按钮（Web 版 brand 风格）
+        if getattr(self, "_new_session_btn", None) is not None:
+            self._new_session_btn.setStyleSheet(
+                "QPushButton {"
+                f"  background-color: {p['brand']};"
+                f"  color: {p['on_brand']};"
+                "  border: none;"
+                "  border-radius: 8px;"
+                "  padding: 8px 12px;"
+                "  font-size: 13px;"
+                "  font-weight: 600;"
+                "  text-align: center;"
+                "}"
+                "QPushButton:hover {"
+                f"  background-color: {p['brand_hover']};"
+                "}"
+            )
+        # 底部设置按钮
+        if getattr(self, "_settings_btn", None) is not None:
+            self._settings_btn.setStyleSheet(
+                "QPushButton {"
+                "  background-color: transparent;"
+                "  border: none;"
+                "  border-radius: 6px;"
+                f"  color: {p['text_mute']};"
+                "  font-size: 13px;"
+                "  padding: 8px 12px;"
+                "  text-align: left;"
+                "}"
+                "QPushButton:hover {"
+                f"  background-color: {p['bg_hover']};"
+                f"  color: {p['text']};"
+                "}"
+            )
         # 关闭按钮
         if getattr(self, "_close_btn", None) is not None:
             self._close_btn.setStyleSheet(
@@ -446,55 +660,54 @@ class LeftPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 顶部关闭按钮行（纯净界面模式）
-        close_row = QHBoxLayout()
-        close_row.setContentsMargins(4, 4, 4, 0)
-        close_row.addStretch()
+        # ===== 顶部导航行（替代 ActivityBar）：会话 / 文件 / 搜索 / Git =====
+        nav_row = QHBoxLayout()
+        nav_row.setContentsMargins(8, 8, 8, 4)
+        nav_row.setSpacing(2)
+        self._nav_btns: dict[str, QPushButton] = {}
+        for key, icon_text in (
+            ("sessions", "会话"),
+            ("files", "文件"),
+            ("search", "搜索"),
+            ("git", "Git"),
+        ):
+            btn = QPushButton(icon_text)
+            btn.setObjectName("SidebarBtn")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked=False, k=key: self._on_nav_clicked(k))
+            self._nav_btns[key] = btn
+            nav_row.addWidget(btn)
+        nav_row.addStretch()
+        # 关闭面板按钮
         self._close_btn = QPushButton("×")
         self._close_btn.setFixedSize(20, 20)
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._close_btn.setToolTip("关闭面板 (Ctrl+B)")
         self._close_btn.clicked.connect(self.close_requested)
-        close_row.addWidget(self._close_btn)
-        close_widget = QWidget()
-        close_widget.setLayout(close_row)
-        layout.addWidget(close_widget)
+        nav_row.addWidget(self._close_btn)
+        nav_widget = QWidget()
+        nav_widget.setObjectName("SidebarHeader")
+        nav_widget.setLayout(nav_row)
+        layout.addWidget(nav_widget)
+        self._nav_btns["sessions"].setChecked(True)
 
         self._stack = QStackedWidget()
 
-        # ===== 页面 1: 会话列表（DSH Web UI 风格） =====
+        # ===== 页面 1: 会话列表（Web 版风格） =====
         sessions_page = QWidget()
         s_layout = QVBoxLayout(sessions_page)
-        s_layout.setContentsMargins(0, 8, 0, 0)
-        s_layout.setSpacing(0)
+        s_layout.setContentsMargins(8, 4, 8, 0)
+        s_layout.setSpacing(4)
 
-        # 顶部：新建会话按钮（accent 色，不随主题文本色变，保持品牌绿）
-        self._new_session_btn = QPushButton("＋  新建会话")
+        # 顶部：新建会话按钮（Web 版 brand 风格，无自定义硬编码色）
+        self._new_session_btn = QPushButton("＋ 新建会话")
+        self._new_session_btn.setObjectName("NewSessionBtn")
         self._new_session_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._new_session_btn.setStyleSheet(
-            "QPushButton {"
-            "  background-color: rgba(50, 240, 140, 0.08);"
-            "  border: 1px solid rgba(50, 240, 140, 0.15);"
-            "  border-radius: 8px;"
-            "  padding: 8px 12px;"
-            "  font-size: 12px;"
-            "  color: #32F08C;"
-            "  text-align: left;"
-            "  margin: 4px 8px;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: rgba(50, 240, 140, 0.15);"
-            "  border-color: rgba(50, 240, 140, 0.3);"
-            "}"
-        )
         self._new_session_btn.clicked.connect(self.new_session_requested)
         s_layout.addWidget(self._new_session_btn)
 
-        lbl = _section_label("工作区")
-        self._section_labels.append(lbl)
-        s_layout.addWidget(lbl)
-
-        # 空状态提示（DSH Web UI 风格：浅灰色"暂无会话"）
+        # 空状态提示
         self._empty_sessions_label = QLabel("暂无会话")
         self._empty_sessions_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         s_layout.addWidget(self._empty_sessions_label)
@@ -548,13 +761,33 @@ class LeftPanel(QWidget):
         g_layout.addWidget(self._git_panel, stretch=1)
         self._git_index = self._stack.addWidget(git_page)
 
-        layout.addWidget(self._stack)
+        layout.addWidget(self._stack, stretch=1)
+
+        # ===== 底部：设置入口（Web sidebar.settings 座） =====
+        self._settings_btn = QPushButton("⚙  设置")
+        self._settings_btn.setObjectName("SidebarBtn")
+        self._settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._settings_btn.clicked.connect(self.settings_requested)
+        settings_row = QHBoxLayout()
+        settings_row.setContentsMargins(8, 4, 8, 8)
+        settings_row.addWidget(self._settings_btn)
+        settings_widget = QWidget()
+        settings_widget.setObjectName("SidebarFooter")
+        settings_widget.setLayout(settings_row)
+        layout.addWidget(settings_widget)
 
         # 默认显示会话列表
         self._stack.setCurrentIndex(self._sessions_index)
 
+    def _on_nav_clicked(self, nav: str) -> None:
+        """顶部导航点击：切换页面并同步按钮选中态。"""
+        for key, btn in self._nav_btns.items():
+            btn.setChecked(key == nav)
+        self.set_nav(nav)
+        self.nav_requested.emit(nav)
+
     def set_nav(self, nav: str) -> None:
-        """根据 ActivityBar 导航切换页面。"""
+        """根据导航切换页面。"""
         nav_map = {
             "sessions": self._sessions_index,
             "files": self._files_index,
@@ -563,13 +796,16 @@ class LeftPanel(QWidget):
         }
         index = nav_map.get(nav, self._sessions_index)
         self._stack.setCurrentIndex(index)
+        if nav in self._nav_btns:
+            for key, btn in self._nav_btns.items():
+                btn.setChecked(key == nav)
 
     def set_mode(self, mode: str) -> None:
         """兼容接口：模式切换不再影响左栏内容，由导航控制。"""
         pass
 
-    def refresh_sessions(self, sessions: list) -> None:
-        self._task_list.refresh(sessions)
+    def refresh_sessions(self, sessions: list, status_map: dict | None = None) -> None:
+        self._task_list.refresh(sessions, status_map=status_map)
         # 空状态：无会话时显示"暂无会话"，有会话时隐藏
         self._empty_sessions_label.setVisible(len(sessions) == 0)
 

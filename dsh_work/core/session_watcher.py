@@ -26,9 +26,9 @@ import os
 import struct
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
 
 try:
     import pyzstd  # type: ignore
@@ -165,7 +165,7 @@ def expand_row(raw_line: str) -> list[dict]:
 class FileRecord:
     size: int = 0               # 文件字节数
     consumed: int = 0           # 已消费到的字节偏移
-    header: Optional[dict] = None   # session 头部（type='session'）
+    header: dict | None = None   # session 头部（type='session'）
     title: str = ""             # 会话标题（session/title 事件）
     baseline: bool = False      # 是否已建立基线（首次见过）
     has_turn_events: bool = False  # 会话中是否出现过 turn 事件（决定计数语义）
@@ -200,7 +200,7 @@ class SessionWatcher:
     def __init__(
         self,
         sessions_dir: str | os.PathLike,
-        on_turn_end: Optional[Callable[[TurnEndEvent], None]] = None,
+        on_turn_end: Callable[[TurnEndEvent], None] | None = None,
     ) -> None:
         self._sessions_dir = Path(sessions_dir)
         self._on_turn_end = on_turn_end or (lambda ev: None)
@@ -210,7 +210,7 @@ class SessionWatcher:
         self._dir_cache_at: float = 0.0
         self._dir_cache_files: list[str] = []
 
-        self._timer: Optional[threading.Thread] = None
+        self._timer: threading.Thread | None = None
         self._stop = threading.Event()
 
     # ------------------------------------------------------------------

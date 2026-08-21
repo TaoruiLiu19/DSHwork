@@ -28,23 +28,31 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QStackedWidget, QLabel
+from PySide6.QtWidgets import QLabel, QStackedWidget, QVBoxLayout, QWidget
 
 from ...api import MessageRecord
 from ...api.balance_client import BalanceResult
 from ...core.session_manager import AgentStatus, ContextUsage
-from ..widgets.message_list import MessageList
-from ..widgets.input_box import InputBox
-from ..widgets.empty_state_cards import EmptyStateCards
+from ..widgets.advanced_docks import ApprovalPanel, QueueDock, TodoDock
 from ..widgets.balance_widget import BalanceWidget
-from ... import constants as C
+from ..widgets.conversation_header import ConversationHeader
+from ..widgets.empty_state_cards import EmptyStateCards
+from ..widgets.input_box import InputBox
+from ..widgets.message_list import MessageList
+from ..widgets.stats_dock import StatsDock
 
 
 class CenterPanel(QWidget):
-    """中栏：对话区域 + 余额小部件 + 输入框。
+    """中栏：Web 版对话列（ConversationHeader + 消息流 + 余额 + 输入条）。
 
-    空状态时显示快捷入口卡片，有消息时显示消息流。
-    工具调用由 MessageList 内部管理，不再由本类中转。
+    布局（对齐 Web 版 Session Header / ChatView / Composer 三明治结构）：
+    ┌──────────────────────────────────────┐
+    │ ConversationHeader（会话标题+视图）   │
+    ├──────────────────────────────────────┤
+    │ 消息流 / 空状态（ChatView）           │
+    │ 余额内联小部件                        │
+    │ 输入条（Composer）                    │
+    └──────────────────────────────────────┘
     """
 
     send_requested = Signal(str)
@@ -54,6 +62,9 @@ class CenterPanel(QWidget):
     card_clicked = Signal(str, str)  # prompt, mode
     scrolled_to_top = Signal()
     balance_refresh_requested = Signal()  # 用户点击余额小部件触发强制刷新
+    usage_requested = Signal()  # 点击「用量」视图
+    conversation_requested = Signal()  # 点击「对话」视图
+    new_session_requested = Signal()  # header 新建会话按钮
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -64,11 +75,18 @@ class CenterPanel(QWidget):
     def _setup_ui(self) -> None:
         """初始化 UI 组件。
 
-        布局：QStackedWidget（空状态/消息流）→ 余额小部件 → 输入框
+        布局：Header → QStackedWidget（空状态/消息流）→ 余额小部件 → 输入框
         """
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        # ===== 对话列头部（会话标题 + 视图切换 + 新建） =====
+        self._header = ConversationHeader()
+        self._header.usage_requested.connect(self.usage_requested)
+        self._header.conversation_requested.connect(self.conversation_requested)
+        self._header.new_session_requested.connect(self.new_session_requested)
+        layout.addWidget(self._header)
 
         # ===== 堆叠：空状态 / 消息流 =====
         self._stack = QStackedWidget()
@@ -89,6 +107,19 @@ class CenterPanel(QWidget):
         self._balance_widget = BalanceWidget()
         self._balance_widget.refresh_requested.connect(self.balance_refresh_requested)
         layout.addWidget(self._balance_widget)
+
+        # ===== StatsDock 统计条（Web 版 sessionStats 行，位于 composer 上方） =====
+        self._stats_dock = StatsDock()
+        layout.addWidget(self._stats_dock)
+
+        # ===== Web 版高级交互条（TodoDock / QueueDock / ApprovalPanel） =====
+        self._todo_dock = TodoDock()
+        layout.addWidget(self._todo_dock)
+        self._queue_dock = QueueDock()
+        layout.addWidget(self._queue_dock)
+        self._approval_panel = ApprovalPanel()
+        self._approval_panel.deny_clicked.connect(self._on_approval_deny)
+        layout.addWidget(self._approval_panel)
 
         # ===== 输入框 =====
         self._input_box = InputBox()
@@ -117,12 +148,76 @@ class CenterPanel(QWidget):
     def append_chunk(self, chunk: str) -> None:
         self._message_list.append_chunk(chunk)
 
-    def finish_streaming(self) -> None:
-        self._message_list.finish_streaming()
+    def finish_streaming(self):
+        """结束流式输出，返回固化后的行（供 turn_end 补齐权威内容用）。"""
+        return self._message_list.finish_streaming()
 
     def is_streaming(self) -> bool:
         """当前是否处于流式输出中（用于事件路由判断）。"""
-        return self._message_list._current_streaming_bubble is not None
+        return self._message_list._current_streaming_row is not None
+
+    def set_streaming_hint(self, text: str | None) -> None:
+        """设置当前流式行的状态提示（思考中…/工具执行中…）。"""
+        row = self._message_list._current_streaming_row
+        if row is not None:
+            row.set_status_hint(text)
+
+    def set_last_assistant_meta(self, text: str | None) -> None:
+        """给最后一条 assistant 行设置 turn tail 统计（Ran for Xs · tokens）。"""
+        for row in reversed(self._message_list._rows):
+            if not row._is_user:
+                row.set_meta(text)
+                return
+
+    # ===== Web 版高级交互（Think 行 / Context 行）=====
+
+    def start_think(self) -> None:
+        """开始思考行（turn_start 时调用）。"""
+        self._message_list.start_think()
+
+    def update_think(self, delta: str) -> None:
+        """追加思考增量（reasoning-delta 事件）。"""
+        self._message_list.update_think(delta)
+
+    def finish_think(self, reasoning: str | None = None) -> None:
+        """结束思考行（turn_end 时调用）。"""
+        self._message_list.finish_think(reasoning)
+
+    def add_context_row(self, label: str, content: str = "") -> None:
+        """添加上下文注入行。"""
+        self._message_list.add_context_row(label, content)
+
+    def set_session_stats(self, projections: dict | None) -> None:
+        """更新 StatsDock（session.list 的 projections.values）。"""
+        if projections:
+            self._stats_dock.set_projections(projections)
+        else:
+            self._stats_dock.clear()
+
+    # ===== Web 版高级交互（Todo / Queue / Approval）=====
+
+    def set_todos(self, todos: list[dict] | None) -> None:
+        """更新计划条（todo/write 或 projections.todos）。"""
+        self._todo_dock.set_todos(todos or [])
+
+    def set_queue(self, entries: list[dict] | None) -> None:
+        """更新排队消息条（agent/inbox/spliced）。"""
+        self._queue_dock.set_queue(entries or [])
+
+    def show_approval(self, approval: dict | None) -> None:
+        """显示审批条（approval/asked）。approval=None 隐藏。"""
+        if approval:
+            self._approval_panel.show_approval(approval)
+        else:
+            self._approval_panel.hide_approval()
+
+    def hide_approval(self) -> None:
+        """隐藏审批条（approval/decided）。"""
+        self._approval_panel.hide_approval()
+
+    def _on_approval_deny(self, approval: dict) -> None:
+        """拒绝审批：中断当前 Agent 执行（尽力而为）。"""
+        self.stop_requested.emit()
 
     def clear_messages(self) -> None:
         self._message_list.clear()
@@ -139,8 +234,7 @@ class CenterPanel(QWidget):
         若当前不是空状态，则切换到空状态（保证提示可见）。
         提示条以一次性卡片形式插入到空状态 widget 顶部；不持久化到 _message_list。
         """
-        from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import QFrame, QVBoxLayout, QLabel
+        from PySide6.QtWidgets import QFrame, QVBoxLayout
 
         existing: QFrame | None = getattr(self._empty_state, "_banner", None)
         if existing is not None:
@@ -196,6 +290,10 @@ class CenterPanel(QWidget):
     def set_mode(self, mode: str) -> None:
         self._input_box.set_mode(mode)
 
+    def set_model_label(self, model: str) -> None:
+        """更新输入条模型座（Web 版 model seat）。"""
+        self._input_box.set_model_label(model)
+
     def set_context_usage(self, context: ContextUsage) -> None:
         self._input_box.set_context_usage(context)
 
@@ -233,3 +331,17 @@ class CenterPanel(QWidget):
     @property
     def balance_widget(self) -> BalanceWidget:
         return self._balance_widget
+
+    # ===== Web 版对话列头部 =====
+
+    def set_session_title(self, title: str) -> None:
+        """更新对话列头部会话标题。"""
+        self._header.set_title(title)
+
+    def set_header_active_view(self, key: str) -> None:
+        """外部切换头部视图高亮（main_window 切换中央堆叠时调用）。"""
+        self._header.set_active_view(key)
+
+    @property
+    def header(self) -> ConversationHeader:
+        return self._header

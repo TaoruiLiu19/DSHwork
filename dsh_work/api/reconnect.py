@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import hashlib
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -94,7 +93,7 @@ class SessionEventBuffer:
         )
         # 时间戳取秒级精度，避免毫秒差异导致去重失败
         ts = int(msg.timestamp)
-        return hashlib.md5(f"{ts}:{content}".encode("utf-8")).hexdigest()
+        return hashlib.md5(f"{ts}:{content}".encode()).hexdigest()
 
 
 class ReconnectManager:

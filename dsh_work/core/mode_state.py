@@ -13,9 +13,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
 
 from .. import constants as C
 from .defaults import get_skills_for_mode, get_system_prompt_for_mode

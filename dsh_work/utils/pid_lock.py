@@ -124,7 +124,7 @@ class PidLock:
         if not self.pid_file.exists():
             return None
         try:
-            with open(self.pid_file, "r", encoding="utf-8") as f:
+            with open(self.pid_file, encoding="utf-8") as f:
                 data = json.load(f)
             return PidInfo.from_dict(data)
         except (json.JSONDecodeError, KeyError, OSError):

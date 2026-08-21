@@ -1,39 +1,66 @@
-"""工具调用卡片与聚合（第 3.3 节）。
+"""工具调用折叠卡片与聚合（对齐 Web 版 ToolRow）。
 
-工具调用内联展示：
-- Agent 调用工具时，在消息流对应位置插入折叠卡片
-- 显示工具名称、状态（执行中/成功/失败）和耗时
-- 点击展开可查看参数和返回结果
-
-工具聚合与时间线可视化（第 3.3 节）：
-- 连续同类工具聚合：同一工具连续调用只显示一个卡片，标题为 "[工具名] 已执行 N 次"
-- 工具类型切换（write_file → run_command）或出现 status: failed 时，完结上一个聚合卡并另起新卡
-- 聚合卡左侧保留微型时间线竖条，颜色区分每次调用状态（蓝=进行中，绿=成功，红=失败）
-- 点击展开为完整列表视图，逐条显示参数与返回码
+Web 版工具行是默认折叠的 disclosure：工具名 + 状态 + 展开箭头，
+展开后显示参数与返回结果。配色全部取自主题 token。
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QPushButton,
-    QFrame,
     QToolButton,
+    QVBoxLayout,
+    QWidget,
 )
 
-from ...core.session_manager import ToolCallRecord
 from ...utils.logger import get_logger
 
 log = get_logger("ui.tool_call_card")
+
+
+def _theme_colors():
+    try:
+        from ..theme.theme_manager import ThemeManager
+        tm = ThemeManager()
+        theme = tm.current
+        if theme and theme.colors:
+            return theme.colors
+    except Exception:
+        pass
+    return None
+
+
+def _palette() -> dict:
+    tc = _theme_colors()
+    if tc:
+        return {
+            "accent": tc.accent,
+            "success": tc.success,
+            "error": tc.error,
+            "text": tc.text_primary,
+            "text2": tc.text_secondary,
+            "muted": tc.text_muted,
+            "card_bg": tc.bg_secondary,
+            "border": tc.divider,
+        }
+    return {
+        "accent": "#679EFE",
+        "success": "#22C55E",
+        "error": "#F25A5A",
+        "text": "#F9FAFB",
+        "text2": "#CFD3D6",
+        "muted": "#ADB2B8",
+        "card_bg": "#1B1B1C",
+        "border": "rgba(255,255,255,0.06)",
+    }
 
 
 @dataclass
@@ -55,49 +82,61 @@ class ToolCallEntry:
 
     @property
     def color(self) -> str:
+        p = _palette()
         if self.status == "running":
-            return "#387BFF"  # TRAE 蓝
+            return p["accent"]
         if self.status == "success":
-            return "#33C192"  # TRAE 绿
-        return "#F65A5A"  # TRAE 红
+            return p["success"]
+        return p["error"]
 
 
 class ToolCallCard(QFrame):
-    """工具调用折叠卡片。
-
-    单次工具调用：显示工具名称、状态、耗时，点击展开参数与返回值。
-    """
+    """工具调用折叠卡片（Web 版 ToolRow：默认折叠的 disclosure）。"""
 
     def __init__(self, tool_name: str, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setObjectName("ToolCallCard")
+        self.setObjectName("ToolRow")
         self.tool_name = tool_name
         self._entries: list[ToolCallEntry] = []
         self._expanded = False
         self._setup_ui()
+        self.apply_theme()
+
+    def apply_theme(self, theme=None) -> None:
+        p = _palette()
+        self.setStyleSheet(
+            f"QFrame#ToolRow {{ background-color: {p['card_bg']};"
+            f" border: 1px solid {p['border']}; border-radius: 8px; }}"
+        )
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(4)
 
-        # 标题行
+        # 标题行（disclosure 头）
         header = QHBoxLayout()
         self._icon_label = QLabel("⚙")
-        self._icon_label.setFixedWidth(20)
+        self._icon_label.setFixedWidth(18)
+        self._icon_label.setStyleSheet(f"color: {_palette()['muted']};")
         header.addWidget(self._icon_label)
 
-        self._title_label = QLabel(f"{self.tool_name}")
-        self._title_label.setStyleSheet("font-weight: 600;")
+        self._title_label = QLabel(self.tool_name)
+        self._title_label.setObjectName("ToolName")
+        self._title_label.setStyleSheet(f"font-weight: 600; color: {_palette()['text']};")
         header.addWidget(self._title_label, stretch=1)
 
         self._status_label = QLabel("执行中...")
-        self._status_label.setStyleSheet("color: #387BFF; font-size: 11px;")
+        self._status_label.setStyleSheet(f"color: {_palette()['accent']}; font-size: 11px;")
         header.addWidget(self._status_label)
 
         self._expand_btn = QToolButton()
         self._expand_btn.setText("▶")
         self._expand_btn.setCheckable(True)
+        self._expand_btn.setStyleSheet(
+            "QToolButton { border: none; background: transparent; color: "
+            + _palette()["muted"] + "; }"
+        )
         self._expand_btn.clicked.connect(self._toggle_expand)
         header.addWidget(self._expand_btn)
 
@@ -109,8 +148,12 @@ class ToolCallCard(QFrame):
 
         # 展开内容（默认隐藏）
         self._detail_label = QLabel()
-        self._detail_label.setStyleSheet("font-family: monospace; font-size: 11px; color: #9599A6;")
+        self._detail_label.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 11px; color: "
+            + _palette()["text2"] + ";"
+        )
         self._detail_label.setWordWrap(True)
+        self._detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._detail_label.setVisible(False)
         layout.addWidget(self._detail_label)
 
@@ -122,6 +165,7 @@ class ToolCallCard(QFrame):
 
     def _update_display(self) -> None:
         """更新卡片显示。"""
+        p = _palette()
         count = len(self._entries)
         running = sum(1 for e in self._entries if e.status == "running")
         failed = sum(1 for e in self._entries if e.status == "failed")
@@ -131,13 +175,13 @@ class ToolCallCard(QFrame):
             entry = self._entries[0]
             if entry.status == "running":
                 self._status_label.setText("执行中...")
-                self._status_label.setStyleSheet("color: #387BFF; font-size: 11px;")
+                self._status_label.setStyleSheet(f"color: {p['accent']}; font-size: 11px;")
             elif entry.status == "success":
                 self._status_label.setText(f"成功 · {entry.duration_ms}ms")
-                self._status_label.setStyleSheet("color: #33C192; font-size: 11px;")
+                self._status_label.setStyleSheet(f"color: {p['success']}; font-size: 11px;")
             else:
                 self._status_label.setText(f"失败 · {entry.error}")
-                self._status_label.setStyleSheet("color: #F65A5A; font-size: 11px;")
+                self._status_label.setStyleSheet(f"color: {p['error']}; font-size: 11px;")
         else:
             # 聚合显示
             parts = []

@@ -9,10 +9,10 @@ DSH 原生工具调用通过 WebSocket 路由；此处提供客户端侧的"外�
 """
 
 from .inspect_image import (
-    InspectImageTool,
     InspectImageResult,
-    inspect_image_sync,
+    InspectImageTool,
     inspect_image_async,
+    inspect_image_sync,
 )
 
 __all__ = [

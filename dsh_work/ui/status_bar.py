@@ -13,19 +13,18 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QWidget,
     QHBoxLayout,
     QLabel,
     QProgressBar,
+    QWidget,
 )
 
-from ..api import CompatibilityMode
-from ..api.balance_client import BalanceResult
-from ..core.session_manager import AgentStatus, ContextUsage
 from .. import constants as C
+from ..api import CompatibilityMode
+from ..core.session_manager import AgentStatus, ContextUsage
 
 
 def _theme_colors():
@@ -41,8 +40,16 @@ def _theme_colors():
 
 
 _FALLBACK = {
-    "divider": "#B5BDC5",
-    "input_bg": "#B5BDC5",
+    "divider": "rgba(255,255,255,0.06)",
+    "input_bg": "#232324",
+    "text": "#F9FAFB",
+    "text2": "#CFD3D6",
+    "muted": "#ADB2B8",
+    "accent": "#679EFE",
+    "accent_secondary": "#679EFE",
+    "success": "#22C55E",
+    "warning": "#F59E0B",
+    "error": "#F25A5A",
 }
 
 
@@ -52,6 +59,14 @@ def _palette() -> dict:
         return {
             "divider": tc.divider or _FALLBACK["divider"],
             "input_bg": tc.input_bg or _FALLBACK["input_bg"],
+            "text": tc.text_primary or _FALLBACK["text"],
+            "text2": tc.text_secondary or _FALLBACK["text2"],
+            "muted": tc.text_muted or _FALLBACK["muted"],
+            "accent": tc.accent or _FALLBACK["accent"],
+            "accent_secondary": tc.accent_secondary or _FALLBACK["accent_secondary"],
+            "success": tc.success or _FALLBACK["success"],
+            "warning": tc.warning or _FALLBACK["warning"],
+            "error": tc.error or _FALLBACK["error"],
         }
     return dict(_FALLBACK)
 
@@ -77,7 +92,7 @@ class StatusIndicator(QWidget):
         self.update()
 
     def paintEvent(self, event) -> None:
-        from PySide6.QtGui import QPainter, QBrush
+        from PySide6.QtGui import QBrush, QPainter
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setBrush(QBrush(QColor(self._color)))
@@ -96,6 +111,44 @@ class StatusBar(QWidget):
         self._tip_timer = None
         self._tip_last_mode = C.MODE_WORK
         self._setup_ui()
+        self.apply_theme()
+        # 主题切换时刷新（避免硬编码色在深浅主题下不可读）
+        try:
+            from .theme.theme_manager import ThemeManager
+            ThemeManager().add_listener(self.apply_theme)
+        except Exception:
+            pass
+
+    def apply_theme(self, theme=None) -> None:
+        """刷新状态栏各标签为当前主题 token 色。"""
+        p = _palette()
+        for lbl in (self._conn_label, self._agent_label, self._context_label,
+                    self._token_label, self._balance_label):
+            if lbl is not None and lbl.text() and not self._is_colored_label(lbl):
+                lbl.setStyleSheet(f"font-size: 11px; color: {p['text2']};")
+        if getattr(self, "_version_label", None) is not None:
+            self._version_label.setStyleSheet(f"font-size: 11px; color: {p['muted']};")
+        if getattr(self, "_mode_label", None) is not None:
+            self._mode_label.setStyleSheet(f"font-size: 11px; color: {p['accent']}; font-weight: 600;")
+        # 连接状态色（按当前状态重刷）
+        cur = getattr(self, "_conn_text", "")
+        if cur:
+            self._apply_conn_style(cur)
+
+    @staticmethod
+    def _is_colored_label(lbl: QLabel) -> bool:
+        """是否已被语义色（连接/模式等）显式着色，避免 apply_theme 覆盖。"""
+        return bool(lbl.property("semantic_color"))
+
+    def _apply_conn_style(self, state: str) -> None:
+        p = _palette()
+        color = {
+            "已连接": p["success"],
+            "兼容模式": p["warning"],
+            "离线": p["error"],
+        }.get(state, p["text2"])
+        self._conn_label.setStyleSheet(f"font-size: 11px; color: {color};")
+        self._conn_label.setProperty("semantic_color", True)
 
     def show_temporary(self, text: str, color: str = "#FFB454", duration_ms: int = 3000) -> None:
         """用 mode_label 临时显示一条提示，duration_ms 之后自动还原为当前 mode。"""
@@ -185,56 +238,51 @@ class StatusBar(QWidget):
 
     def set_connection_status(self, mode: CompatibilityMode) -> None:
         """设置连接状态。"""
-        if mode == CompatibilityMode.FULL:
-            self._conn_indicator.set_status(StatusIndicator._COLOR_SUCCESS, "已连接")
-            self._conn_label.setText("已连接")
-            self._conn_label.setStyleSheet(f"font-size: 11px; color: {StatusIndicator._COLOR_SUCCESS};")
-        elif mode == CompatibilityMode.DEGRADED:
-            self._conn_indicator.set_status(StatusIndicator._COLOR_WARNING, "兼容模式")
-            self._conn_label.setText("兼容模式")
-            self._conn_label.setStyleSheet(f"font-size: 11px; color: {StatusIndicator._COLOR_WARNING};")
-        else:
-            self._conn_indicator.set_status(StatusIndicator._COLOR_ERROR, "离线")
-            self._conn_label.setText("离线")
-            self._conn_label.setStyleSheet(f"font-size: 11px; color: {StatusIndicator._COLOR_ERROR};")
+        p = _palette()
+        self._conn_text = {
+            CompatibilityMode.FULL: "已连接",
+            CompatibilityMode.DEGRADED: "兼容模式",
+        }.get(mode, "离线")
+        color = {
+            CompatibilityMode.FULL: p["success"],
+            CompatibilityMode.DEGRADED: p["warning"],
+        }.get(mode, p["error"])
+        self._conn_indicator.set_status(color, self._conn_text)
+        self._conn_label.setText(self._conn_text)
+        self._apply_conn_style(self._conn_text)
 
     def set_agent_status(self, status: AgentStatus, turn: int = 0, step: int = 0) -> None:
         """设置 Agent 状态。"""
-        # TRAE 语义色
-        trae_blue = "#387BFF"
-        trae_purple = "#B655FC"
-        trae_teal = "#2DD288"
-        trae_error = "#F65A5A"
-        trae_muted = "#9599A6"
+        p = _palette()
         if status == AgentStatus.RUNNING:
             self._agent_label.setText(f"Running · Turn {turn}")
-            self._agent_label.setStyleSheet(f"font-size: 11px; color: {trae_blue};")
+            self._agent_label.setStyleSheet(f"font-size: 11px; color: {p['accent']};")
         elif status == AgentStatus.THINKING:
             self._agent_label.setText(f"Thinking · Turn {turn}")
-            self._agent_label.setStyleSheet(f"font-size: 11px; color: {trae_purple};")
+            self._agent_label.setStyleSheet(f"font-size: 11px; color: {p['accent_secondary']};")
         elif status == AgentStatus.TOOL_EXECUTING:
             self._agent_label.setText(f"Tool · Step {step}")
-            self._agent_label.setStyleSheet(f"font-size: 11px; color: {trae_teal};")
+            self._agent_label.setStyleSheet(f"font-size: 11px; color: {p['success']};")
         elif status == AgentStatus.ERROR:
             self._agent_label.setText("Error")
-            self._agent_label.setStyleSheet(f"font-size: 11px; color: {trae_error};")
+            self._agent_label.setStyleSheet(f"font-size: 11px; color: {p['error']};")
         else:
             self._agent_label.setText("Idle")
-            self._agent_label.setStyleSheet(f"font-size: 11px; color: {trae_muted};")
+            self._agent_label.setStyleSheet(f"font-size: 11px; color: {p['muted']};")
 
     def set_context_usage(self, context: ContextUsage) -> None:
         """设置上下文容量。"""
+        p = _palette()
         used_k = context.used_tokens // 1000
         limit_k = context.limit_tokens // 1000
         self._context_label.setText(f"上下文 {used_k}k/{limit_k}k")
         self._context_bar.setValue(context.percentage)
         color_map = {
-            "accent": "#32F08C",
-            "warning": "#D27E24",
-            "error": "#F65A5A",
+            "accent": p["accent"],
+            "warning": p["warning"],
+            "error": p["error"],
         }
-        color = color_map.get(context.color_key, "#32F08C")
-        p = _palette()
+        color = color_map.get(context.color_key, p["accent"])
         self._context_bar.setStyleSheet(
             f"QProgressBar {{ background-color: {p['input_bg']}; border: none; border-radius: 3px; }}"
             f"QProgressBar::chunk {{ background-color: {color}; border-radius: 3px; }}"
@@ -242,40 +290,44 @@ class StatusBar(QWidget):
 
     def set_token_usage(self, input_tokens: int, output_tokens: int) -> None:
         """设置 Token 用量。"""
+        p = _palette()
         self._token_label.setText(f"Token: ↑{input_tokens} ↓{output_tokens}")
+        self._token_label.setStyleSheet(f"font-size: 11px; color: {p['text2']};")
 
     def set_balance(self, result) -> None:
         """设置余额显示。"""
-        from ..api.balance_client import BalanceSource
+        p = _palette()
         if not result.is_available:
             self._balance_label.setText("余额: 不可用")
-            self._balance_label.setStyleSheet("font-size: 11px; color: #666B75;")
+            self._balance_label.setStyleSheet(f"font-size: 11px; color: {p['muted']};")
             return
         self._balance_label.setText(f"余额: ¥{result.balance:.2f} ({result.source_label})")
-        self._balance_label.setStyleSheet("font-size: 11px; color: #9599A6;")
+        self._balance_label.setStyleSheet(f"font-size: 11px; color: {p['text2']};")
 
     def set_dsh_version(self, version: str) -> None:
         self._version_label.setText(f"DSH v{version}")
 
     def set_mode(self, mode: str) -> None:
         """仅保留下方 mode 常量兼容逻辑。真实显式显示调用 set_preset。"""
+        p = _palette()
         if mode == C.MODE_CODE:
             self._mode_label.setText("[Code]")
-            self._mode_label.setStyleSheet("font-size: 11px; color: #7BB8FF; font-weight: 600;")
+            self._mode_label.setStyleSheet(f"font-size: 11px; color: {p['accent']}; font-weight: 600;")
         else:
             self._mode_label.setText("[Work]")
-            self._mode_label.setStyleSheet("font-size: 11px; color: #32F08C; font-weight: 600;")
+            self._mode_label.setStyleSheet(f"font-size: 11px; color: {p['success']}; font-weight: 600;")
 
     def set_preset(self, preset_id: str, preset_name: str) -> None:
         """状态栏常驻显示当前 Agent Preset 中文名（区分 4 种预设）。"""
-        # 颜色按 preset 区分，对应 Web UI 原生区分感
+        p = _palette()
+        # 颜色按 preset 区分（token 色系，深浅主题均可读）
         color_map = {
-            "standard": "#32F08C",  # 绿（标准）
-            "code":     "#7BB8FF",  # 蓝（PTC/编码）
-            "minimal":  "#F2C94C",  # 黄（极简）
-            "cordis":   "#BB86FC",  # 紫（创造）
+            "standard": p["success"],   # 绿（标准）
+            "code":     p["accent"],    # 蓝（PTC/编码）
+            "minimal":  p["warning"],   # 黄（极简）
+            "cordis":   p["accent_secondary"],  # 紫（创造）
         }
-        color = color_map.get(preset_id, "#D1D3DB")
+        color = color_map.get(preset_id, p["text2"])
         self._tip_last_mode_text = f"[{preset_name}]"
         self._mode_label.setText(f"[{preset_name}]")
         self._mode_label.setStyleSheet(

@@ -24,13 +24,13 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
 
 from .. import constants as C
 from ..utils.logger import get_logger
-from ..utils.pid_lock import PidLock, PidInfo
+from ..utils.pid_lock import PidLock
 
 log = get_logger("core.process_manager")
 
@@ -651,14 +651,19 @@ class ProcessManager:
         # 端口被占，校验 PID 所有权
         pid_info = self.pid_lock.read()
         if pid_info is None:
-            # 端口被占但无 PID 文件 → 上次崩溃残留的孤儿进程
-            # （正常退出时 stop_dsh 会写 PID 文件并清理端口；无 PID 文件说明
-            #  上次进程未走完清理流程就退出了，残留的 node/dsh 仍占用 3080。）
-            # 复用这种孤儿会导致本次启动在 init 阶段异常退出（WebSocket/会话状态不一致），
-            # 因此统一清理孤儿，由后续 start_dsh 启动全新 DSH，保证本次启动稳定。
+            # 端口被占但无 PID 文件。两种可能：
+            #  a) 上次崩溃残留的孤儿进程（正常退出时 stop_dsh 会写 PID 文件并清理端口）
+            #  b) 用户手动启动的 DSH（如 `dsh --profile web`，Web 版正在使用中）
+            # 区分方法：向该端口做一次 Typert RPC 探测（host.describe），
+            # 成功 → 是健康 DSH → 复用（EXTERNAL，退出不杀进程），
+            # 失败 → 判定为孤儿 → 清理后由本客户端重新拉起。
+            if self._probe_dsh_service():
+                self._ownership = ProcessOwnership.EXTERNAL
+                log.info("端口 %d 无 PID 文件但 RPC 探测为健康 DSH，判定为外部 DSH，复用（不清理）", C.DSH_DEFAULT_PORT)
+                return True
             self._ownership = ProcessOwnership.NOT_RUNNING
             log.warning(
-                "端口 %d 被占但无 PID 文件，判定为上次崩溃残留孤儿，正在清理...",
+                "端口 %d 被占但无 PID 文件且 RPC 探测失败，判定为上次崩溃残留孤儿，正在清理...",
                 C.DSH_DEFAULT_PORT,
             )
             killed = self._kill_port_owner(C.DSH_DEFAULT_PORT)
@@ -686,6 +691,28 @@ class ProcessManager:
             self.pid_lock.kill_stale()
             return False
 
+    @staticmethod
+    def _probe_dsh_service() -> bool:
+        """向默认端口发起 Typert RPC 探测（host.describe），判断是否为健康 DSH 服务。
+
+        用于"端口被占但无 PID 文件"的所有权判定：
+        成功说明端口上运行的是可用 DSH（用户手动启动 / Web 版正在使用），应复用而非清理。
+        """
+        try:
+            from ..api.http_client import HttpClient, RpcError
+            client = HttpClient()
+            try:
+                result = client.call("host.describe", {})
+                if isinstance(result, dict) and result.get("version"):
+                    return True
+            except RpcError:
+                return False
+            except Exception:
+                return False
+        except Exception as e:
+            log.debug("DSH RPC 探测失败(不致命): %s", e)
+        return False
+
     # ===== DSH 进程启动 =====
 
     def start_dsh(self, workspace: str = "", timeout: int = C.DSH_STARTUP_TIMEOUT_SEC) -> bool:
@@ -702,7 +729,6 @@ class ProcessManager:
         - 解析 "dsh web: http://host:port" 行，把实际端口用于就绪检测（比写死 3080 更准）
         - 超时后用 taskkill /T 清理子进程树，避免挂起的 npx/node
         """
-        import shutil
 
         # 1. 先检查端口是否已被占（已有 DSH 在跑 → 直接复用）
         if self._check_dsh_running():

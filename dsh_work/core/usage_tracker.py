@@ -20,12 +20,11 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field, asdict
-from functools import lru_cache
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
-from .. import constants as C
 from ..utils.logger import get_logger
 
 log = get_logger("core.usage_tracker")
@@ -85,7 +84,7 @@ def _is_peak(ts_ms: int) -> bool:
 PricingRegime = Literal["base", "peakValley", "auto"]
 
 
-def _cost_for(rec: "UsageRecord", regime: PricingRegime, pricing: dict) -> float:
+def _cost_for(rec: UsageRecord, regime: PricingRegime, pricing: dict) -> float:
     """按指定计价模式计算单次调用消耗（单位：元）。与插件 costFor 完全一致。"""
     mk = _model_key(rec.model)
     hit = rec.cache_read_tokens
@@ -136,7 +135,7 @@ class UsageRecord:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "UsageRecord | None":
+    def from_dict(cls, d: dict) -> UsageRecord | None:
         try:
             ts = int(d.get("time", 0))
             if ts <= 0:
@@ -728,7 +727,7 @@ class UsageTracker:
     def import_csv(self, path: str | os.PathLike) -> tuple[int, int]:
         """从 CSV 导入记录，按 time 去重。CSV 首行为表头，需包含 time 列。"""
         try:
-            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            with open(path, encoding="utf-8-sig", newline="") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
         except (OSError, csv.Error) as e:

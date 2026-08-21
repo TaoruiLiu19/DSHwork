@@ -10,18 +10,18 @@ import threading
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QLabel,
-    QProgressBar,
-    QPlainTextEdit,
-    QPushButton,
     QDialog,
     QHBoxLayout,
+    QLabel,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ... import constants as C
-from ...core.process_manager import ProcessManager, EnvironmentCheck
+from ...core.process_manager import EnvironmentCheck, ProcessManager
 from ...utils.logger import get_logger
 
 log = get_logger("ui.splash_screen")
@@ -429,9 +429,11 @@ class SplashScreen(QDialog):
         self.accept()
 
     def _export_diagnostics(self) -> None:
-        from PySide6.QtWidgets import QFileDialog
-        from ...utils.logger import export_diagnostics_bundle
         from pathlib import Path
+
+        from PySide6.QtWidgets import QFileDialog
+
+        from ...utils.logger import export_diagnostics_bundle
 
         target = QFileDialog.getExistingDirectory(self, "选择导出目录")
         if target:

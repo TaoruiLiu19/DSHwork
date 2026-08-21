@@ -7,17 +7,18 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .. import constants as C
 from ..utils.logger import get_logger
+
 # from ..core.usage_tracker import UsageTracker  # 懒加载：避免循环导入
 from .balance_client import BalanceClient, BalanceResult
 from .http_client import HttpClient, RpcError
 from .reconnect import ReconnectManager
 from .version_adapter import AdapterProbeResult, CompatibilityMode, VersionAdapter
-from .ws_client import WSMessage, WebSocketClient
+from .ws_client import WebSocketClient
 
 log = get_logger("api.dsh_service")
 
@@ -32,7 +33,14 @@ def _get(data: dict, *keys: str, default: Any = None) -> Any:
 
 @dataclass
 class SessionInfo:
-    """会话信息。"""
+    """会话信息。
+
+    除基础字段外，携带 session.list 的 projections（Web 版投影数据）：
+    - sessionStats: {turns, steps, llmMs, toolMs, ttftMs, decodeMs, decodeTokens}
+    - tokenUsage / contextPressure / contextBreakdown
+    - todos: [{content, status}]  ← TodoDock 计划条数据源
+    - goal / plan / permissions / subagent / imageLimits
+    """
 
     id: str
     title: str = ""
@@ -40,6 +48,10 @@ class SessionInfo:
     updated_at: float = 0.0
     model: str = ""
     message_count: int = 0
+    cwd: str = ""
+    running: bool = False
+    blank: bool = False
+    projections: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -89,9 +101,13 @@ class DshService:
         self._ws_started = False
         # session.models 需要 sessionId，get_models 首次调用时懒创建临时 session 复用
         self._bootstrap_session_id: str | None = None
+        # bootstrap 临时会话 id 集合：这些会话不展示给用户（Web 侧创建的会话不受影响）
+        self._bootstrap_session_ids: set[str] = set()
         # model -> provider 缓存（从 session.models.groups 提取，给 selectModel 用）
         self._model_provider: dict[str, str] = {}
         self._default_provider: str = "deepseek-official"  # DSH 0.0.1 默认内置 provider id
+        # DSH 当前默认模型（host.describe 探测，用量记录 model 兜底用）
+        self.default_model: str = ""
 
     # ===== 生命周期 =====
 
@@ -108,7 +124,7 @@ class DshService:
             creds_file = os.path.join(os.path.expanduser("~"), ".dsh", ".credentials.yaml")
             if not os.path.isfile(creds_file):
                 return
-            with open(creds_file, "r", encoding="utf-8") as f:
+            with open(creds_file, encoding="utf-8") as f:
                 txt = f.read()
             m = re.search(r"DEEPSEEK_API_KEY\s*:\s*['\"]?([^'\"\n]+)", txt)
             if m and m.group(1).strip():
@@ -121,6 +137,13 @@ class DshService:
         result = self.adapter.probe()
         if result.mode == CompatibilityMode.FULL:
             log.info("DSH 服务初始化完成: version=%s mode=FULL", result.version)
+            # 探测当前默认模型（用量记录 model 兜底：TOKEN_USAGE 无 model 字段时用）
+            try:
+                desc = self.http.call("host.describe", {})
+                if isinstance(desc, dict) and desc.get("model"):
+                    self.default_model = str(desc["model"])
+            except Exception:
+                pass
         elif result.mode == CompatibilityMode.DEGRADED:
             log.warning("DSH 版本适配器探测失败: %s，进入%s模式",
                         result.error, result.mode.value)
@@ -219,8 +242,9 @@ class DshService:
     def list_sessions(self) -> list[SessionInfo]:
         """列出所有会话。
 
-        过滤掉 bootstrap 内部会话（无标题且无消息）——这些是 get_models()
-        为拉取模型列表而自动创建的临时会话，不应展示给用户。
+        只过滤本客户端为拉取模型列表而创建的 bootstrap 临时会话
+        （其 sessionId 记录在 _bootstrap_session_ids 中）；
+        Web 版 / 其他客户端创建的空白会话会正常展示（互通）。
         """
         result = self.http.call("session.list", {})
         items: Any = []
@@ -239,8 +263,8 @@ class DshService:
         # 缓存第一个可用 sessionId 作为 get_models 的兜底（从全量列表中取）
         if not self._bootstrap_session_id and all_infos:
             self._bootstrap_session_id = all_infos[0].id
-        # 过滤 bootstrap 会话：无标题且无消息 → 内部临时会话，不展示
-        infos = [s for s in all_infos if s.title or s.message_count > 0]
+        # 只过滤 bootstrap 临时会话（内部 id 集合命中），其余全部展示
+        infos = [s for s in all_infos if s.id not in self._bootstrap_session_ids]
         return infos
 
     def get_history(
@@ -312,6 +336,40 @@ class DshService:
                 out.append(data)
         return out
 
+    def get_full_events(self, session_id: str, limit: int = 200) -> list[dict]:
+        """获取会话完整事件流（与 Web 版同源：含 reasoning-delta、approval、todo 等）。
+
+        session.history 返回 {events:[{event:{type,seq,time,data}},...]}，
+        这里解包为 [{type, seq, time, data}] 平铺结构，供 Think 行 / Context 行 /
+        审批 / 计划的历史回放。limit 为事件条数上限。
+        """
+        params: dict[str, Any] = {"sessionId": session_id, "limit": limit}
+        try:
+            result = self.http.call("session.history", params)
+        except RpcError:
+            return []
+        events_raw: Any = []
+        if isinstance(result, dict):
+            events_raw = result.get("events") or []
+        elif isinstance(result, list):
+            events_raw = result
+        out: list[dict] = []
+        for e in events_raw:
+            if not isinstance(e, dict):
+                continue
+            ev = e.get("event") if isinstance(e.get("event"), dict) else e
+            etype = str(ev.get("type") or "")
+            if not etype:
+                continue
+            out.append({
+                "type": etype,
+                "seq": ev.get("seq", 0),
+                "time": ev.get("time", 0),
+                "data": ev.get("data") if isinstance(ev.get("data"), dict) else {},
+            })
+        out.sort(key=lambda x: x.get("seq", 0))
+        return out
+
     def select_model(self, session_id: str, model: str) -> bool:
         """切换模型。DSH Typert 严格要求 {sessionId, model, provider} 三个 camelCase 字段。"""
         provider = self._model_provider.get(model)
@@ -343,6 +401,8 @@ class DshService:
                 sid = info.id
                 if sid:
                     self._bootstrap_session_id = sid
+                    # 记录为内部临时会话，list_sessions 时不展示
+                    self._bootstrap_session_ids.add(sid)
             except Exception as e:
                 log.debug("get_models 创建 bootstrap session 失败: %s", e)
                 return []
@@ -590,6 +650,19 @@ class DshService:
         created_at = float(_get(inner, "createdAt", "created_at", "created", default=0) or 0)
         updated_at = float(_get(inner, "updatedAt", "updated_at", "updated", default=0) or 0)
         message_count = int(_get(inner, "messageCount", "message_count", "size", "count", default=0) or 0)
+        # —— Web 版投影数据（session.list 的 projections.values）——
+        projections: dict = {}
+        pj = inner.get("projections")
+        if isinstance(pj, dict):
+            vals = pj.get("values")
+            if isinstance(vals, dict):
+                projections = vals
+        # 标题可能在 projections.values.title（list 返回结构）
+        if not title and isinstance(projections.get("title"), str):
+            title = projections["title"]
+        cwd = str(_get(inner, "cwd", default=""))
+        running = bool(_get(inner, "running", default=False))
+        blank = bool(_get(inner, "blank", default=False))
         return SessionInfo(
             id=sid,
             title=title,
@@ -597,6 +670,10 @@ class DshService:
             updated_at=_parse_iso_ts(updated_at, raw=updated_at),
             model=model,
             message_count=message_count,
+            cwd=cwd,
+            running=running,
+            blank=blank,
+            projections=projections,
         )
 
     @staticmethod
@@ -668,7 +745,7 @@ def _parse_iso_ts(value: Any, raw: Any = None) -> float:
         return float(value)
     if isinstance(value, str):
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime
             # 支持 2026-...T...Z 和带小数秒的格式
             s = value.replace("Z", "+00:00")
             return datetime.fromisoformat(s).timestamp()

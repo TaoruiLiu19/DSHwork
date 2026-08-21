@@ -72,7 +72,10 @@ Write-Step "Inno Setup 编译安装包"
 & $iscc "installer\dsh-work.iss"
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败 (rc=$LASTEXITCODE)" }
 
-$setup = Join-Path $root "installer\Output\DSHWork-Setup-0.3.0.exe"
+# 从 dsh-work.iss 读取版本号（单一来源，避免硬编码漂移）
+$issMatch = Select-String -Path "installer\dsh-work.iss" -Pattern '^#define MyAppVersion\s+"([^"]+)"'
+$issVersion = if ($issMatch) { $issMatch.Matches[0].Groups[1].Value } else { "0.0.0" }
+$setup = Join-Path $root "installer\Output\DSHWork-Setup-$issVersion.exe"
 if (Test-Path $setup) {
     Write-Host "安装包产出: $setup ($([math]::Round((Get-Item $setup).Length/1MB,1)) MB)" -ForegroundColor Green
     Write-Host "安装包比对: DSHWork.exe 自身 $([math]::Round((Get-Item (Join-Path $root 'dist\DSHWork.exe')).Length/1MB,1)) MB —— 安装包通常比单 exe 小 ~10MB（LZMA2 压缩）" -ForegroundColor Green

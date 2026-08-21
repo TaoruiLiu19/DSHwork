@@ -53,9 +53,9 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Optional
 
 from ..utils.logger import get_logger
 
@@ -98,9 +98,9 @@ class RendererRecoveryMachine:
         *,
         max_retries: int = 3,
         stable_alive_secs: int = 30,
-        recover_fn: Optional[Callable[[int], None]] = None,
-        give_up_fn: Optional[Callable[[int], None]] = None,
-        timer_cls: Optional[type] = None,
+        recover_fn: Callable[[int], None] | None = None,
+        give_up_fn: Callable[[int], None] | None = None,
+        timer_cls: type | None = None,
     ) -> None:
         """
         Args:
@@ -126,8 +126,8 @@ class RendererRecoveryMachine:
         self._crash_count = 0
         self._gave_up = False
         self._give_up_count = 0
-        self._created_at: Optional[float] = None     # 最近一次 track_created() 的时间戳
-        self._stable_timer: Optional[object] = None  # threading.Timer 或 QTimer adapter
+        self._created_at: float | None = None     # 最近一次 track_created() 的时间戳
+        self._stable_timer: object | None = None  # threading.Timer 或 QTimer adapter
 
     # ------------------------------ 对外 API ------------------------------
 
@@ -252,7 +252,7 @@ class RendererRecoveryMachine:
             self._gave_up = False
 
     @staticmethod
-    def _safe_invoke(fn: Optional[Callable[[int], None]], arg: int) -> None:
+    def _safe_invoke(fn: Callable[[int], None] | None, arg: int) -> None:
         if not callable(fn):
             return
         try:

@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
 
 import requests
 from requests.adapters import HTTPAdapter

@@ -1,0 +1,53 @@
+{
+  "name": "Web Light",
+  "type": "light",
+  "colors": {
+    "bg_primary": "#FFFFFF",
+    "bg_secondary": "#F5F6F7",
+    "bg_sidebar": "#FFFFFF",
+    "bg_hover": "rgba(38, 49, 72, 0.06)",
+    "bg_active": "rgba(38, 49, 72, 0.10)",
+    "bg_card": "#F9FAFB",
+    "text_primary": "#0F1115",
+    "text_secondary": "#61666B",
+    "text_muted": "#81858C",
+    "text_caption": "#ADB2B8",
+    "brand_primary": "#0F1115",
+    "accent": "#4176E6",
+    "accent_hover": "#5686FE",
+    "accent_secondary": "#4176E6",
+    "success": "#22C55E",
+    "warning": "#F59E0B",
+    "error": "#EC1313",
+    "border": "rgba(0, 0, 0, 0.10)",
+    "border_light": "rgba(0, 0, 0, 0.16)",
+    "divider": "rgba(0, 0, 0, 0.06)",
+    "gridline": "rgba(0, 0, 0, 0.04)",
+    "input_bg": "#FFFFFF",
+    "input_border": "rgba(0, 0, 0, 0.12)",
+    "tab_border": "rgba(0, 0, 0, 0.08)",
+    "btn_border": "rgba(0, 0, 0, 0.10)",
+    "markdown_code_bg": "#F9FAFB",
+    "markdown_code_banner": "#F9FAFB",
+    "markdown_inline_bg": "#EBEEF2",
+    "markdown_block_border": "rgba(0, 0, 0, 0.06)",
+    "tooltip_bg": "#232324",
+    "scrollbar_handle": "rgba(0, 0, 0, 0.16)",
+    "state_dot_running": "#4176E6",
+    "state_dot_pending": "#F59E0B",
+    "state_dot_done": "#22C55E"
+  },
+  "background": {
+    "image": "",
+    "mask_color": "#000000",
+    "mask_opacity": 0.3,
+    "background_attachment": "fixed"
+  },
+  "effects": {
+    "glass_effect": false,
+    "glass_blur": 20,
+    "glass_opacity": 0.75,
+    "bubble_radius": 8,
+    "animation": "smooth"
+  }
+}

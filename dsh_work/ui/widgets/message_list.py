@@ -1,54 +1,158 @@
-"""消息流。
+"""消息流（对齐 DSH Web 版 ChatView）。
 
-垂直滚动区域，按时间顺序展示消息气泡。
-- 用户消息右对齐，Assistant 消息左对齐
-- 工具调用以折叠卡片形式内联嵌入
-- 支持流式渲染——Assistant 回复时逐字显示（WebSocket chunk 事件）
+Web 版对话流是全宽消息行（非气泡）：
+- 用户消息：右对齐（最大 ~85% 宽），无气泡背景，头部「你 · 时间」
+- Assistant 消息：左对齐全宽，Markdown 完整渲染（代码块/表格/行内码）
+- 完成后的 assistant 消息 hover 显示操作（复制）
+- 工具调用以折叠卡片形式内联嵌入（ToolRow，后续对齐 Web 折叠样式）
+- 支持流式渲染——assistant 回复逐块显示（WebSocket chunk 事件）
 
-参考 DSH Web UI 对话展示设计：
-- 消息头部简洁，角色名 + 时间戳
-- 用户消息气泡使用主题色背景，右对齐
-- Assistant 消息气泡使用卡片背景，左对齐
-- 消息间距紧凑，代码块有单独样式
+消息内容用 MarkdownTextEdit 渲染（md_to_html → QTextEdit），
+配色全部来自主题 token，与 Web 版 markdown 渲染一致。
 """
 
 from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent
-from PySide6.QtGui import QPixmap, QColor, QPainter
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QScrollArea,
-    QWidget,
-    QVBoxLayout,
+    QApplication,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QFrame,
+    QPushButton,
+    QScrollArea,
     QSizePolicy,
-    QApplication,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ...api import MessageRecord
 from ...utils.logger import get_logger
+from .markdown_view import MarkdownTextEdit
 from .tool_call_card import ToolCallAggregator, ToolCallCard
 
 log = get_logger("ui.message_list")
 
-# 气泡最大宽度 = 视口宽度 * 比例
-_BUBBLE_MAX_WIDTH_RATIO = 0.80
-# 气泡内部左右 padding
-_BUBBLE_HPAD = 16
+# 用户消息最大宽度 = 视口宽度 * 比例
+_USER_MAX_WIDTH_RATIO = 0.85
 # 时间戳格式
 _TIMESTAMP_FORMAT = "%H:%M"
 
 
-class MessageBubble(QFrame):
-    """单条消息气泡。
+class CollapsibleRow(QFrame):
+    """可折叠行基类（Web 版 DisclosureRow 语义）：头部点击切换展开/收起。"""
 
-    用户消息右对齐，Assistant 消息左对齐。
-    包含角色名头部、内容、时间戳。
-    背景受主题系统控制。
+    def __init__(self, title: str, icon: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._expanded = False
+        self._setup_ui(title, icon)
+
+    def _setup_ui(self, title: str, icon: str) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        if icon:
+            self._icon_label = QLabel(icon)
+            self._icon_label.setObjectName("Caption")
+            header.addWidget(self._icon_label)
+        self._title_label = QLabel(title)
+        self._title_label.setObjectName("ThinkTitle")
+        header.addWidget(self._title_label, stretch=1)
+        self._toggle_btn = QPushButton("▶")
+        self._toggle_btn.setObjectName("MsgActionBtn")
+        self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle_btn.setFixedWidth(24)
+        self._toggle_btn.clicked.connect(self.toggle)
+        header.addWidget(self._toggle_btn)
+        layout.addLayout(header)
+
+        self._body = MarkdownTextEdit()
+        self._body.setVisible(False)
+        layout.addWidget(self._body)
+
+    def set_title(self, title: str) -> None:
+        self._title_label.setText(title)
+
+    def set_body_text(self, text: str) -> None:
+        self._body.set_markdown(text)
+
+    def set_body_visible(self, visible: bool) -> None:
+        self._body.setVisible(visible)
+
+    def toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._toggle_btn.setText("▼" if self._expanded else "▶")
+        self._body.setVisible(self._expanded)
+        self._on_toggled()
+
+    def _on_toggled(self) -> None:
+        pass
+
+
+class ThinkRow(CollapsibleRow):
+    """思考行（Web 版 ThinkRow）：默认折叠，实时摘要尾随，展开显示完整推理。
+
+    - 流式中：标题「思考中…」，摘要实时更新（首行）
+    - TURN_END 后：标题「已思考」，保持折叠
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__("思考中…", icon="🧠", parent=parent)
+        self.setObjectName("ThinkRow")
+        self._reasoning = ""
+
+    def append_reasoning(self, delta: str) -> None:
+        """追加思考文本，更新摘要与全文。"""
+        self._reasoning += delta
+        self._update_display()
+
+    def set_reasoning(self, text: str) -> None:
+        self._reasoning = text or ""
+        self._update_display()
+
+    def _update_display(self) -> None:
+        summary = self._summary_line()
+        if not self._expanded:
+            self._title_label.setText(f"思考中… {summary}")
+        self.set_body_text(self._reasoning)
+
+    def _summary_line(self) -> str:
+        """摘要：首个非空行，截断 60 字。"""
+        for line in self._reasoning.splitlines():
+            line = line.strip()
+            if line:
+                return line[:60] + ("…" if len(line) > 60 else "")
+        return self._reasoning[:60]
+
+    def finalize(self) -> None:
+        """TURN_END：标记为已思考并收拢。"""
+        summary = self._summary_line()
+        self.set_title(f"已思考 {summary}" if summary else "已思考")
+        self.set_body_text(self._reasoning)
+        if not self._expanded:
+            self._toggle_btn.setText("▶")
+
+
+class ContextRow(CollapsibleRow):
+    """上下文注入行（Web 版 DisclosureRow）：折叠展示注入/召回的上下文来源。"""
+
+    def __init__(self, label: str, content: str = "", parent: QWidget | None = None):
+        super().__init__(label, icon="📥", parent=parent)
+        self.setObjectName("ContextRow")
+        if content:
+            self.set_body_text(content)
+
+
+class MessageRow(QFrame):
+    """Web 版消息行（全宽，无气泡背景）。
+
+    用户消息右对齐（窄行），Assistant 消息左对齐全宽。
     """
 
     def __init__(self, role: str, content: str, timestamp: float = 0.0, parent: QWidget | None = None):
@@ -56,92 +160,132 @@ class MessageBubble(QFrame):
         self.role = role
         self.content = content
         self.timestamp = timestamp
-        self._max_width_override: int | None = None
-
-        # 标记是否为用户消息
         self._is_user = role == "user"
+        self._max_width_override: int | None = None
+        # 已渲染内容长度（流式增量用；构造时 set_markdown 已渲染全部）
+        self._rendered_len = len(content)
 
         self._setup_ui()
 
     def set_max_width_viewport(self, viewport_width: int) -> None:
-        """根据聊天区 viewport 宽度设置气泡最大宽度（外部 resize 时调用）。"""
+        """根据聊天区 viewport 宽度设置消息宽度。
+
+        消息气泡与对话栏同宽（用户消息也全宽），不做 85% 窄化；
+        用户消息通过内部右对齐体现"在右侧"。
+        """
         if viewport_width <= 0:
             return
-        limit = int(viewport_width * _BUBBLE_MAX_WIDTH_RATIO)
-        self._max_width_override = limit
-        self.setMaximumWidth(limit)
-        # 同步限制内容标签最大宽度
-        if self._content_label is not None:
-            margin_total = _BUBBLE_HPAD * 2 + 4  # 4 for border
-            self._content_label.setMaximumWidth(max(1, limit - margin_total))
-            self._content_label.updateGeometry()
+        self.setMaximumWidth(16777215)  # 不限制宽度（全宽）
 
     def _setup_ui(self) -> None:
-        """初始化 UI 组件。
-
-        布局结构：
-        ┌──────────────────────────────────┐
-        │  角色名 · 时间戳                  │
-        │  ┌──────────────────────────┐    │
-        │  │ 消息内容                  │    │
-        │  │ (自动换行，填满气泡宽度)   │    │
-        │  └──────────────────────────┘    │
-        └──────────────────────────────────┘
-        """
-        # 设置 objectName 用于 QSS 样式
+        """布局：头部（角色·时间）→ Markdown 内容。"""
         if self._is_user:
-            self.setObjectName("MessageBubbleUser")
+            self.setObjectName("MessageRowUser")
         else:
-            self.setObjectName("MessageBubbleAssistant")
+            self.setObjectName("MessageRow")
 
-        # 主布局
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(_BUBBLE_HPAD, 10, _BUBBLE_HPAD, 10)
-        layout.setSpacing(6)
-        layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetDefaultConstraint)
+        layout.setContentsMargins(4, 8, 4, 8)
+        layout.setSpacing(4)
 
-        # 消息头部：角色名 + 时间戳（更简洁的样式）
+        # 头部行：角色名 · 时间 + （assistant 完成时）复制按钮
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
+
         self._header_label = QLabel()
-        self._header_label.setObjectName("MessageBubbleHeader")
+        self._header_label.setObjectName("MessageRole" if not self._is_user else "MessageRoleUser")
         header_text = "你" if self._is_user else "Assistant"
         if self.timestamp > 0:
             from datetime import datetime
             ts_str = datetime.fromtimestamp(self.timestamp).strftime(_TIMESTAMP_FORMAT)
             header_text = f"{header_text} · {ts_str}"
         self._header_label.setText(header_text)
-        self._header_label.setStyleSheet(
-            "font-size: 11px; font-weight: 500; color: inherit;"
-        )
-        layout.addWidget(self._header_label)
 
-        # 消息内容（支持 Markdown）
-        self._content_label = QLabel(self.content)
-        self._content_label.setWordWrap(True)
-        self._content_label.setTextFormat(Qt.TextFormat.MarkdownText)
-        self._content_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self._content_label.setOpenExternalLinks(True)
-        # 最小宽度为 1 防止标签消失
-        self._content_label.setMinimumWidth(1)
+        # 位置：用户消息（我说的）头部靠右，回复头部靠左
+        if self._is_user:
+            header_row.addStretch()
+            header_row.addWidget(self._header_label)
+            # 用户消息状态提示跟在角色标签后（右侧）
+            self._status_hint = QLabel()
+            self._status_hint.setObjectName("Caption")
+            self._status_hint.setVisible(False)
+            header_row.addWidget(self._status_hint)
+        else:
+            header_row.addWidget(self._header_label)
+            # 状态提示（思考中…/工具执行中…，Web 版 ThinkRow 头部）
+            self._status_hint = QLabel()
+            self._status_hint.setObjectName("Caption")
+            self._status_hint.setVisible(False)
+            header_row.addWidget(self._status_hint)
+            header_row.addStretch()
 
-        # 内容标签：水平 Expanding 填满气泡宽度，垂直 Preferred 允许高度增长
-        self._content_label.setSizePolicy(
+        # hover 复制按钮（仅 assistant，且内容非空）
+        self._copy_btn = QPushButton("复制")
+        self._copy_btn.setObjectName("MsgActionBtn")
+        self._copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_btn.setVisible(False)
+        self._copy_btn.clicked.connect(self._copy_content)
+        header_row.addWidget(self._copy_btn)
+
+        layout.addLayout(header_row)
+
+        # Markdown 内容（自适应高度；用户消息内容右对齐）
+        self._content_view = MarkdownTextEdit()
+        self._content_view.set_markdown(self.content)
+        if self._is_user:
+            self._content_view.set_align_right(True)
+        self._content_view.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred,
         )
-        layout.addWidget(self._content_label)
+        layout.addWidget(self._content_view)
 
-        # 气泡自身尺寸策略
+        # turn tail 统计行（Ran for Xs · tokens 等，Web 版 assistant footer）
+        self._meta_label = QLabel()
+        self._meta_label.setObjectName("TurnTailMeta")
+        self._meta_label.setVisible(False)
+        layout.addWidget(self._meta_label)
+
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred,
         )
 
+    def set_status_hint(self, text: str | None) -> None:
+        """设置状态提示（思考中…等）。text=None 隐藏。"""
+        if text:
+            self._status_hint.setText(text)
+            self._status_hint.setVisible(True)
+        else:
+            self._status_hint.setVisible(False)
+
+    def set_meta(self, text: str | None) -> None:
+        """设置 turn tail 统计行（Ran for Xs · TTFT · tokens）。"""
+        if text:
+            self._meta_label.setText(text)
+            self._meta_label.setVisible(True)
+        else:
+            self._meta_label.setVisible(False)
+
+    def _copy_content(self) -> None:
+        from PySide6.QtWidgets import QApplication as _QA
+        _QA.clipboard().setText(self.content)
+        self._copy_btn.setText("已复制")
+        QTimer.singleShot(1200, lambda: self._copy_btn.setText("复制"))
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        if not self._is_user and self.content:
+            self._copy_btn.setVisible(True)
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._copy_btn.setVisible(False)
+
     def update_content(self, content: str) -> None:
-        """流式更新内容，同步刷新几何尺寸。"""
+        """完整更新内容（历史加载 / 主题切换等一次性渲染）。"""
         self.content = content
-        self._content_label.setText(content)
-        # 强制重新布局
-        self._content_label.updateGeometry()
+        self._content_view.set_markdown(content)
+        self._content_view.updateGeometry()
         self.updateGeometry()
         self.update()
 
@@ -156,6 +300,22 @@ class MessageBubble(QFrame):
             parent.update()
             parent = parent.parentWidget()
 
+    def append_stream_content(self, content: str) -> None:
+        """流式增量：只追加新增文本（纯文本，避免每 chunk 全量重排卡顿）。"""
+        self.content = content
+        delta = content[self._rendered_len:]
+        if delta:
+            self._content_view.append_plain(delta)
+            self._rendered_len = len(content)
+        self.update()
+
+    def finalize_content(self) -> None:
+        """流式结束：全量 markdown 排版（恢复粗体/代码块等格式）。"""
+        if self._rendered_len == len(self.content) and self._content_view.document().isEmpty() is False:
+            self._content_view.set_markdown(self.content)
+            self._rendered_len = len(self.content)
+        self.update()
+
         # 发送 LayoutRequest 事件让 QScrollArea 重新计算
         QApplication.postEvent(self, QEvent(QEvent.Type.LayoutRequest))
         top = self
@@ -165,10 +325,9 @@ class MessageBubble(QFrame):
 
 
 class MessageList(QScrollArea):
-    """消息流滚动区域。
+    """消息流滚动区域（Web 版 ChatView 滚动体）。
 
-    支持流式渲染、背景固定、消息管理。
-    参考 DSH Web UI ChatView 设计。
+    支持流式渲染、背景固定、消息管理、工具调用卡片内联。
     """
 
     # 信号：用户滚动到顶部（触发追加加载历史）
@@ -180,9 +339,11 @@ class MessageList(QScrollArea):
         super().__init__(parent)
         self._setup_ui()
 
-        # 消息气泡列表
-        self._bubbles: list[MessageBubble] = []
-        self._current_streaming_bubble: MessageBubble | None = None
+        # 消息行列表
+        self._rows: list[MessageRow] = []
+        self._current_streaming_row: MessageRow | None = None
+        # 当前思考行（ThinkRow）
+        self._current_think_row: ThinkRow | None = None
 
         # 背景固定渲染
         self._background_pixmap: QPixmap | None = None
@@ -193,17 +354,40 @@ class MessageList(QScrollArea):
         # 流式输出
         self._stream_pending = False
         self._user_is_scrolling_up = False
+        # 历史分批渲染待处理队列
+        self._pending_batch: list = []
 
         # 工具调用聚合器（内联管理工具卡片）
         self._tool_aggregator = ToolCallAggregator()
         self._tool_aggregator.set_create_callback(self._insert_tool_card)
 
-    def _setup_ui(self) -> None:
-        """初始化 UI。
+        # 主题刷新：MessageList 是长存对象，统一注册一个监听，
+        # 遍历现有行的 MarkdownTextEdit 重渲（单行不注册，避免删除后泄漏）
+        try:
+            from ..theme.theme_manager import ThemeManager
+            ThemeManager().add_listener(self._refresh_theme)
+        except Exception:
+            pass
 
-        使用 QScrollArea 包裹一个 QWidget 容器，
-        容器内用 QVBoxLayout 管理消息气泡，底部有 stretch 让消息从底部开始排列。
-        """
+    def _refresh_theme(self, theme=None) -> None:
+        """主题切换：刷新所有现存 MarkdownTextEdit（含 ThinkRow/ContextRow 折叠体）。"""
+        try:
+            for row in self._rows:
+                try:
+                    if getattr(row, "_content_view", None) is not None:
+                        row._content_view.rerender_for_theme(theme)
+                except RuntimeError:
+                    pass
+            for view in self._container.findChildren(MarkdownTextEdit):
+                try:
+                    view.rerender_for_theme(theme)
+                except RuntimeError:
+                    pass
+        except Exception:
+            pass
+
+    def _setup_ui(self) -> None:
+        """使用 QScrollArea 包裹 QWidget 容器，消息从顶部排列。"""
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -212,9 +396,9 @@ class MessageList(QScrollArea):
         self._container = QWidget()
         self._container.setObjectName("MessageListContainer")
         self._layout = QVBoxLayout(self._container)
-        self._layout.setContentsMargins(16, 16, 16, 16)
-        self._layout.setSpacing(16)
-        # 底部 stretch：让消息从顶部开始排列，stretch 在底部
+        self._layout.setContentsMargins(24, 16, 24, 16)
+        self._layout.setSpacing(8)
+        # 顶部与底部 stretch：消息默认从顶部开始
         self._layout.addStretch()
         self.setWidget(self._container)
 
@@ -222,12 +406,12 @@ class MessageList(QScrollArea):
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
     def resizeEvent(self, event) -> None:
-        """窗口尺寸变化：重算所有气泡的最大宽度 + 重建背景缓存。"""
+        """窗口尺寸变化：重算用户消息最大宽度 + 重建背景缓存。"""
         super().resizeEvent(event)
         vp_w = self.viewport().width()
         if vp_w > 0:
-            for b in self._bubbles:
-                b.set_max_width_viewport(vp_w)
+            for r in self._rows:
+                r.set_max_width_viewport(vp_w)
         if self._background_pixmap:
             self._rebuild_background_cache()
 
@@ -238,10 +422,10 @@ class MessageList(QScrollArea):
             w = 0
         return w if w > 0 else self.width()
 
-    def _apply_bubble_viewport_width(self, bubble: MessageBubble) -> None:
+    def _apply_row_viewport_width(self, row: MessageRow) -> None:
         vp_w = self._viewport_width()
         if vp_w > 0:
-            bubble.set_max_width_viewport(vp_w)
+            row.set_max_width_viewport(vp_w)
 
     def _on_scroll(self, value: int) -> None:
         """滚动事件处理。"""
@@ -258,126 +442,101 @@ class MessageList(QScrollArea):
 
     # ===== 消息管理 =====
 
-    def add_message(self, message: MessageRecord) -> MessageBubble:
-        """添加一条消息气泡。"""
-        bubble = MessageBubble(message.role, message.content, timestamp=getattr(message, "timestamp", 0))
-        self._apply_bubble_viewport_width(bubble)
-
-        # 创建对齐包装器
-        wrapper = self._wrap_alignment(bubble, align_right=message.role == "user")
-
-        # 插入到 stretch 之前
-        self._layout.insertWidget(self._layout.count() - 1, wrapper)
-        self._bubbles.append(bubble)
-
-        # 强制重新布局
-        self._layout.activate()
-
-        # 滚动到底部
-        if message.role == "user" or not self._user_is_scrolling_up:
-            QTimer.singleShot(0, self.scroll_to_bottom)
-        return bubble
+    def add_message(self, message: MessageRecord) -> MessageRow:
+        """添加一条消息行。"""
+        row = MessageRow(message.role, message.content, timestamp=getattr(message, "timestamp", 0))
+        self._apply_row_viewport_width(row)
+        self._insert_row(row)
+        return row
 
     def load_messages_batch(self, messages: list[MessageRecord]) -> None:
-        """批量加载历史消息（切换会话时使用）。"""
+        """批量加载历史消息（切换会话时使用）。
+
+        分批渲染（每批 25 条）：历史消息多时避免一次性全量创建
+        QTextBrowser 导致 UI 冻结（切换会话卡顿）。
+        """
         self.clear()
-        for message in messages:
-            bubble = MessageBubble(message.role, message.content, timestamp=getattr(message, "timestamp", 0))
-            self._apply_bubble_viewport_width(bubble)
-            wrapper = self._wrap_alignment(bubble, align_right=message.role == "user")
-            self._layout.insertWidget(self._layout.count() - 1, wrapper)
-            self._bubbles.append(bubble)
+        self._pending_batch = list(messages)
+        QTimer.singleShot(0, self._load_batch_chunk)
+
+    def _load_batch_chunk(self) -> None:
+        """渲染下一批历史消息。"""
+        if not getattr(self, "_pending_batch", None):
+            QTimer.singleShot(0, self.scroll_to_bottom)
+            return
+        batch = self._pending_batch[:25]
+        self._pending_batch = self._pending_batch[25:]
+        for message in batch:
+            row = MessageRow(message.role, message.content, timestamp=getattr(message, "timestamp", 0))
+            self._apply_row_viewport_width(row)
+            self._insert_row(row)
         self._layout.activate()
         self.viewport().update()
-        QTimer.singleShot(0, self.scroll_to_bottom)
-
-    def _wrap_alignment(self, widget: QWidget, align_right: bool) -> QWidget:
-        """包装对齐容器。
-
-        用户消息右对齐，Assistant 消息左对齐。
-        使用 QHBoxLayout + stretch 实现对齐。
-        """
-        wrapper = QWidget()
-        wrapper.setObjectName("MessageWrapper")
-        wrapper_layout = QHBoxLayout(wrapper)
-        wrapper_layout.setContentsMargins(0, 0, 0, 0)
-        wrapper_layout.setSpacing(0)
-        wrapper_layout.setSizeConstraint(QHBoxLayout.SizeConstraint.SetDefaultConstraint)
-
-        if align_right:
-            wrapper_layout.addStretch(1)
-            wrapper_layout.addWidget(widget, stretch=0)
+        if self._pending_batch:
+            QTimer.singleShot(0, self._load_batch_chunk)
         else:
-            wrapper_layout.addWidget(widget, stretch=0)
-            wrapper_layout.addStretch(1)
+            QTimer.singleShot(0, self.scroll_to_bottom)
 
-        wrapper.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        return wrapper
+    def _insert_row(self, row: MessageRow) -> None:
+        """插入到 stretch 之前。"""
+        self._layout.insertWidget(self._layout.count() - 1, row)
+        self._rows.append(row)
+        self._layout.activate()
 
-    def start_streaming(self) -> MessageBubble:
-        """开始流式输出，创建临时气泡。"""
-        log.info("[DEBUG] MessageList.start_streaming() 被调用")
-        bubble = MessageBubble("assistant", "", timestamp=time.time())
-        self._apply_bubble_viewport_width(bubble)
-        self._current_streaming_bubble = bubble
-        wrapper = self._wrap_alignment(bubble, align_right=False)
-        self._layout.insertWidget(self._layout.count() - 1, wrapper)
-        self._bubbles.append(bubble)
+    def start_streaming(self) -> MessageRow:
+        """开始流式输出，创建临时行。"""
+        row = MessageRow("assistant", "", timestamp=time.time())
+        self._apply_row_viewport_width(row)
+        self._current_streaming_row = row
+        self._insert_row(row)
         if not self._user_is_scrolling_up:
             QTimer.singleShot(0, self.scroll_to_bottom)
-        return bubble
+        return row
 
     def append_chunk(self, chunk: str) -> None:
-        """追加流式 chunk（立即刷新，无缓冲延迟）。
-
-        使用 singleShot(0) 将同一事件循环内的多个 chunk 合并为一次更新，
-        既保证文字逐步出现，又避免过度布局计算。
-        """
-        if not self._current_streaming_bubble:
-            log.warning("[DEBUG] append_chunk 但 _current_streaming_bubble 为 None，丢弃 chunk_len=%d", len(chunk))
+        """追加流式 chunk（事件循环末尾合并刷新）。"""
+        if not self._current_streaming_row:
+            log.debug("append_chunk 但无流式行，丢弃 chunk_len=%d", len(chunk))
             return
-        log.info("[DEBUG] append_chunk: chunk_len=%d, 当前内容长度=%d", len(chunk), len(self._current_streaming_bubble.content))
-        # 直接追加到当前气泡内容
-        self._current_streaming_bubble.content += chunk
+        self._current_streaming_row.content += chunk
         self.chunk_appended.emit(chunk)
-        # 延迟到事件循环末尾刷新 UI，合并同一轮的所有 chunk
         if not self._stream_pending:
             self._stream_pending = True
             QTimer.singleShot(0, self._flush_stream)
 
     def _flush_stream(self) -> None:
-        """将累积的内容刷新到气泡标签（事件循环末尾执行一次）。"""
+        """将累积的内容增量追加到渲染视图（事件循环末尾执行一次）。
+
+        流式期间用纯文本增量插入（append_stream_content），避免每个 chunk
+        全量重建 HTML + 重排大文档导致主线程卡顿（"对话不实时"）。
+        """
         self._stream_pending = False
-        if not self._current_streaming_bubble:
+        if not self._current_streaming_row:
             return
-        self._current_streaming_bubble.update_content(
-            self._current_streaming_bubble.content
-        )
+        self._current_streaming_row.append_stream_content(self._current_streaming_row.content)
         self._layout.activate()
         self.viewport().update()
         if not self._user_is_scrolling_up:
             QTimer.singleShot(0, self.scroll_to_bottom)
 
-    def finish_streaming(self) -> MessageBubble | None:
-        """结束流式输出，返回固化后的气泡。"""
-        log.info("[DEBUG] finish_streaming: 被调用, 气泡内容长度=%d, has_bubble=%s",
-                 len(self._current_streaming_bubble.content) if self._current_streaming_bubble else 0,
-                 self._current_streaming_bubble is not None)
+    def finish_streaming(self) -> MessageRow | None:
+        """结束流式输出：全量 markdown 排版并返回固化后的行。"""
         if self._stream_pending:
             self._flush_stream()
-        bubble = self._current_streaming_bubble
+        row = self._current_streaming_row
+        if row is not None:
+            row.finalize_content()
         if not self._user_is_scrolling_up:
             QTimer.singleShot(0, self.scroll_to_bottom)
-        self._current_streaming_bubble = None
-        log.info("[DEBUG] finish_streaming: 完成, 气泡已定稿")
-        return bubble
+        self._current_streaming_row = None
+        return row
 
     def clear(self) -> None:
         """清空所有消息（切换会话时调用）。"""
-        log.info("[DEBUG] MessageList.clear: 被调用, 当前气泡数=%d, _current_streaming_bubble=%s",
-                 len(self._bubbles), self._current_streaming_bubble is not None)
         self._stream_pending = False
-        self._current_streaming_bubble = None
+        self._current_streaming_row = None
+        self._current_think_row = None
+        self._pending_batch = []  # 取消未完成的分批渲染
         # 重置工具调用聚合器
         self._tool_aggregator = ToolCallAggregator()
         self._tool_aggregator.set_create_callback(self._insert_tool_card)
@@ -387,7 +546,7 @@ class MessageList(QScrollArea):
             item = self._layout.takeAt(0)
             if item and item.widget():
                 item.widget().deleteLater()
-        self._bubbles.clear()
+        self._rows.clear()
 
     # ===== 工具调用管理（内联嵌入消息流） =====
 
@@ -404,24 +563,54 @@ class MessageList(QScrollArea):
         self._layout.insertWidget(self._layout.count() - 1, card)
         self._layout.activate()
 
+    # ===== 思考行（ThinkRow）管理 =====
+
+    def start_think(self) -> ThinkRow:
+        """开始思考行（turn_start 时调用）。"""
+        self._current_think_row = ThinkRow()
+        self._insert_row_widget(self._current_think_row)
+        return self._current_think_row
+
+    def update_think(self, delta: str) -> None:
+        """追加思考增量（reasoning-delta 事件）。"""
+        row = self._current_think_row
+        if row is not None:
+            row.append_reasoning(delta)
+
+    def finish_think(self, reasoning: str | None = None) -> None:
+        """结束思考行（turn_end 时调用，用完整 reasoning 回填）。"""
+        row = self._current_think_row
+        if row is not None:
+            if reasoning:
+                row.set_reasoning(reasoning)
+            row.finalize()
+        self._current_think_row = None
+
+    def _insert_row_widget(self, widget: QWidget) -> None:
+        """通用插入（stretch 之前）。"""
+        self._layout.insertWidget(self._layout.count() - 1, widget)
+        self._layout.activate()
+
+    def add_context_row(self, label: str, content: str = "") -> None:
+        """添加上下文注入行（Web 版 ContextRow）。"""
+        row = ContextRow(label, content)
+        self._insert_row_widget(row)
+
     def scroll_to_bottom(self) -> None:
         """滚动到底部。"""
         bar = self.verticalScrollBar()
         bar.setValue(bar.maximum())
 
-    # ===== 背景固定渲染 =====
+    # ===== 背景固定渲染（主题背景图，Web 主题下无背景图时跳过） =====
 
     def set_background_image(self, image_path: str, mask_color: str, mask_opacity: float) -> None:
-        """设置背景图片（视口锚定，fixed）。"""
         from pathlib import Path
 
         path = Path(image_path)
         if not path.exists():
-            log.warning("背景图片不存在: %s", image_path)
             return
         self._background_pixmap = QPixmap(str(path))
         if self._background_pixmap.isNull():
-            log.warning("背景图片加载失败: %s", image_path)
             self._background_pixmap = None
             return
         self._mask_color = QColor(mask_color)
@@ -430,13 +619,11 @@ class MessageList(QScrollArea):
         self.viewport().update()
 
     def clear_background(self) -> None:
-        """清除背景图片。"""
         self._background_pixmap = None
         self._background_cache_pixmap = None
         self.viewport().update()
 
     def _rebuild_background_cache(self) -> None:
-        """重建背景缓存 Pixmap（窗口尺寸变化时调用）。"""
         if not self._background_pixmap:
             return
         size = self.viewport().size()
@@ -450,7 +637,6 @@ class MessageList(QScrollArea):
         cache = QPixmap(size)
         painter = QPainter(cache)
         painter.drawPixmap(0, 0, scaled)
-        # 叠加半透明遮罩
         mask = QColor(self._mask_color)
         mask.setAlphaF(self._mask_opacity)
         painter.fillRect(cache.rect(), mask)
@@ -458,7 +644,6 @@ class MessageList(QScrollArea):
         self._background_cache_pixmap = cache
 
     def paintEvent(self, event) -> None:
-        """重写绘制：在视口坐标系 (0,0) 原点绘制背景（不应用滚动偏移）。"""
         if self._background_cache_pixmap:
             painter = QPainter(self.viewport())
             painter.drawPixmap(0, 0, self._background_cache_pixmap)

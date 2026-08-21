@@ -22,33 +22,73 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFontMetrics, QColor
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFontMetrics
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QPlainTextEdit,
-    QPushButton,
-    QProgressBar,
-    QLabel,
     QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
     QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
 
-from ...core.session_manager import ContextUsage, AgentStatus
 from ... import constants as C
+from ...core.session_manager import AgentStatus, ContextUsage
 
 # 输入框最小/最大行数
 _MIN_VISIBLE_LINES = 1
 _MAX_VISIBLE_LINES = 8
 
 
-class _AutoResizeTextEdit(QPlainTextEdit):
-    """自动根据内容调整高度的文本输入框。
+def _theme_colors():
+    try:
+        from ..theme.theme_manager import ThemeManager
+        tm = ThemeManager()
+        theme = tm.current
+        if theme and theme.colors:
+            return theme.colors
+    except Exception:
+        pass
+    return None
 
-    最小高度 1 行，最大高度 8 行，超出则出现滚动条。
+
+def _palette() -> dict:
+    tc = _theme_colors()
+    if tc:
+        return {
+            "text": tc.text_primary,
+            "text2": tc.text_secondary,
+            "muted": tc.text_muted,
+            "accent": tc.accent,
+            "success": tc.success,
+            "warning": tc.warning,
+            "error": tc.error,
+            "bg": tc.bg_primary,
+            "card": tc.bg_secondary,
+            "border": tc.input_border,
+            "divider": tc.divider,
+        }
+    return {
+        "text": "#F9FAFB", "text2": "#CFD3D6", "muted": "#ADB2B8",
+        "accent": "#679EFE", "success": "#22C55E", "warning": "#F59E0B",
+        "error": "#F25A5A", "bg": "#151517", "card": "#232324",
+        "border": "rgba(255,255,255,0.12)", "divider": "rgba(255,255,255,0.06)",
+    }
+
+
+class _AutoResizeTextEdit(QPlainTextEdit):
+    """自动根据内容调整高度的文本输入框（Web 版 textarea）。
+
+    - Enter / Ctrl+Enter → 发送（send_requested 信号）
+    - Shift+Enter → 换行
+    - 最小高度 1 行，最大高度 8 行，超出滚动
     """
+
+    send_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -63,6 +103,25 @@ class _AutoResizeTextEdit(QPlainTextEdit):
         self._max_height: int = 0
         # 文档内容变化时自动调整高度（处理粘贴、撤销等操作）
         self.document().contentsChanged.connect(self._on_content_changed)
+
+    def keyPressEvent(self, event) -> None:
+        """Enter 语义对齐 Web 版 composer：
+        - Enter / Ctrl+Enter → 发送
+        - Shift+Enter → 换行
+        - Ctrl+Backspace → 删除前一个词
+        """
+        modifiers = event.modifiers()
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not shift:
+            self.send_requested.emit()
+            return
+        if event.key() == Qt.Key.Key_Backspace and (modifiers & Qt.KeyboardModifier.ControlModifier):
+            cursor = self.textCursor()
+            cursor.select(cursor.Selection.WordUnderCursor)
+            cursor.removeSelectedText()
+            return
+        super().keyPressEvent(event)
 
     def _on_content_changed(self) -> None:
         """文档内容变化时调整高度。"""
@@ -104,18 +163,9 @@ class _AutoResizeTextEdit(QPlainTextEdit):
         super().resizeEvent(event)
         QTimer.singleShot(0, self._update_height)
 
-    def keyPressEvent(self, event) -> None:
-        # Ctrl+Backspace 删除前一个词
-        if event.key() == Qt.Key.Key_Backspace and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            cursor = self.textCursor()
-            cursor.select(cursor.Selection.WordUnderCursor)
-            cursor.removeSelectedText()
-            return
-        super().keyPressEvent(event)
-
 
 class InputBox(QWidget):
-    """消息输入框。
+    """消息输入条（对齐 Web 版 Composer Bar）。
 
     信号：
         send_requested(str): 用户请求发送消息
@@ -167,9 +217,9 @@ class InputBox(QWidget):
         # ===== 上下文容量指示器 =====
         self._setup_context_indicators(main_layout)
 
-        # ===== 输入容器（带圆角背景） =====
+        # ===== 输入容器（Web 版 composer 圆角容器） =====
         input_container = QFrame()
-        input_container.setObjectName("InputContainer")
+        input_container.setObjectName("ComposerFrame")
         container_layout = QVBoxLayout(input_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
@@ -186,7 +236,7 @@ class InputBox(QWidget):
         # 文本输入
         self._setup_text_area(container_layout)
 
-        # 底部操作栏
+        # 底部操作栏（Web 版 composer bar 底行）
         self._setup_bottom_bar(container_layout)
 
         main_layout.addWidget(input_container)
@@ -198,7 +248,8 @@ class InputBox(QWidget):
         self.setAcceptDrops(True)
 
     def _setup_context_indicators(self, parent_layout: QVBoxLayout) -> None:
-        """上下文容量指示器。"""
+        """上下文容量指示器（Web 版 ContextMeter 的进度条形态）。"""
+        p = _palette()
         # 上下文容量进度条
         self._context_bar = QProgressBar()
         self._context_bar.setFixedHeight(3)
@@ -209,13 +260,13 @@ class InputBox(QWidget):
         # 上下文容量文本
         self._context_label = QLabel()
         self._context_label.setObjectName("Muted")
-        self._context_label.setStyleSheet("font-size: 11px; color: #9599A6;")
+        self._context_label.setStyleSheet(f"font-size: 11px; color: {p['muted']};")
         self._context_label.setVisible(False)
         parent_layout.addWidget(self._context_label)
 
         # 阈值提示
         self._warn_label = QLabel()
-        self._warn_label.setStyleSheet("color: #D27E24; font-size: 11px;")
+        self._warn_label.setStyleSheet(f"color: {p['warning']}; font-size: 11px;")
         self._warn_label.setVisible(False)
         parent_layout.addWidget(self._warn_label)
 
@@ -245,7 +296,7 @@ class InputBox(QWidget):
         # 附件计数
         self._attach_label = QLabel()
         self._attach_label.setObjectName("Muted")
-        self._attach_label.setStyleSheet("font-size: 11px; color: #9599A6;")
+        self._attach_label.setStyleSheet(f"font-size: 11px; color: {_palette()['muted']};")
         self._attach_label.setVisible(False)
         top_bar.addWidget(self._attach_label)
 
@@ -255,31 +306,47 @@ class InputBox(QWidget):
     def _setup_text_area(self, parent_layout: QVBoxLayout) -> None:
         """文本输入区域。"""
         self._text_edit = _AutoResizeTextEdit()
+        self._text_edit.setObjectName("ComposerTextEdit")
         self._text_edit.setPlaceholderText(self._current_placeholder)
+        self._text_edit.send_requested.connect(self._on_send)
         # 设置最小高度为一行高度
         self._text_edit.document().contentsChanged.connect(self._on_text_changed)
         parent_layout.addWidget(self._text_edit)
 
     def _setup_bottom_bar(self, parent_layout: QVBoxLayout) -> None:
-        """底部操作栏：附件按钮 + 发送按钮。"""
+        """底部操作栏：附件 + 提示 + 模型座 + 发送/停止（对齐 Web composer bar）。"""
+        p = _palette()
         bottom_bar = QHBoxLayout()
         bottom_bar.setContentsMargins(8, 4, 8, 8)
         bottom_bar.setSpacing(6)
 
-        # 附件按钮
+        # 附件按钮（Web 版 + 号左侧工具位）
         self._attach_btn = QPushButton("📎")
         self._attach_btn.setFixedSize(28, 28)
-        self._attach_btn.setObjectName("InputActionBtn")
+        self._attach_btn.setObjectName("ComposerToolBtn")
         self._attach_btn.setToolTip("拖拽文件到输入框，或点击选择文件")
         self._attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         bottom_bar.addWidget(self._attach_btn)
 
+        # 快捷键提示（Web 版 placeholder 广告位）
+        self._hint_label = QLabel("Enter 发送 · Shift+Enter 换行")
+        self._hint_label.setObjectName("Caption")
+        self._hint_label.setStyleSheet(f"color: {p['muted']}; font-size: 11px;")
+        bottom_bar.addWidget(self._hint_label)
+
         bottom_bar.addStretch()
 
-        # 发送按钮
+        # 模型座（Web 版 model seat，由外部 set_model_label 填充）
+        self._model_label = QLabel()
+        self._model_label.setObjectName("Caption")
+        self._model_label.setStyleSheet(f"color: {p['text2']}; font-size: 11px;")
+        self._model_label.setVisible(False)
+        bottom_bar.addWidget(self._model_label)
+
+        # 发送/停止按钮
         self._send_btn = QPushButton("发送")
-        self._send_btn.setObjectName("Primary")
-        self._send_btn.setFixedSize(64, 28)
+        self._send_btn.setObjectName("SendButton")
+        self._send_btn.setFixedSize(72, 30)
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._send_btn.clicked.connect(self._on_send)
         bottom_bar.addWidget(self._send_btn)
@@ -348,11 +415,11 @@ class InputBox(QWidget):
         self._agent_status = status
         if status == AgentStatus.RUNNING or status == AgentStatus.THINKING or status == AgentStatus.TOOL_EXECUTING:
             self._send_btn.setText("停止")
-            self._send_btn.setObjectName("Danger")
+            self._send_btn.setObjectName("StopButton")
             self._send_btn.setEnabled(True)
         else:
             self._send_btn.setText("发送")
-            self._send_btn.setObjectName("Primary")
+            self._send_btn.setObjectName("SendButton")
             has_text = bool(self._text_edit.toPlainText().strip())
             self._send_btn.setEnabled(has_text)
         # 刷新样式
@@ -371,7 +438,8 @@ class InputBox(QWidget):
             self._text_edit.setPlaceholderText(self._current_placeholder)
 
     def set_context_usage(self, context: ContextUsage) -> None:
-        """更新上下文容量显示。"""
+        """更新上下文容量显示（Web 版 ContextMeter 的进度条形态）。"""
+        p = _palette()
         self._context = context
         pct = context.percentage
         self._context_bar.setValue(pct)
@@ -380,26 +448,38 @@ class InputBox(QWidget):
             f"上下文 {context.used_tokens // 1000}k / {context.limit_tokens // 1000}k ({pct}%)"
         )
         self._context_label.setVisible(True)
+        self._context_label.setStyleSheet(f"font-size: 11px; color: {p['muted']};")
 
-        # 颜色编码
+        # 颜色编码：<70% 蓝 / 70-90% 橙 / >90% 红（Web 版 contextBreakdown 分段色）
         color_key = context.color_key
         color_map = {
-            "accent": "#32F08C",
-            "warning": "#D27E24",
-            "error": "#F65A5A",
+            "accent": p["accent"],
+            "warning": p["warning"],
+            "error": p["error"],
         }
-        color = color_map.get(color_key, "#32F08C")
+        color = color_map.get(color_key, p["accent"])
         self._context_bar.setStyleSheet(
-            f"QProgressBar {{ background-color: rgba(255,255,255,0.04); border: none; border-radius: 2px; }}"
+            f"QProgressBar {{ background-color: {p['divider']}; border: none; border-radius: 2px; }}"
             f"QProgressBar::chunk {{ background-color: {color}; border-radius: 2px; }}"
         )
 
         # 阈值提示
         if context.is_warning:
             self._warn_label.setText("上下文即将用尽，可 Fork 或新建会话")
+            self._warn_label.setStyleSheet(f"color: {p['warning']}; font-size: 11px;")
             self._warn_label.setVisible(True)
         else:
             self._warn_label.setVisible(False)
+
+    def set_model_label(self, model: str) -> None:
+        """设置模型座显示（Web 版 model seat）。"""
+        p = _palette()
+        if model:
+            self._model_label.setText(model)
+            self._model_label.setStyleSheet(f"color: {p['text2']}; font-size: 11px;")
+            self._model_label.setVisible(True)
+        else:
+            self._model_label.setVisible(False)
 
     def keyPressEvent(self, event) -> None:
         """Enter 发送，Shift+Enter 换行。"""

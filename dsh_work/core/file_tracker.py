@@ -22,12 +22,10 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, asdict, field
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
-from typing import Callable
 
-from .. import constants as C
 from ..paths import Paths
 from ..utils.logger import get_logger
 
@@ -52,7 +50,7 @@ class FileSnapshot:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "FileSnapshot":
+    def from_dict(cls, d: dict) -> FileSnapshot:
         return cls(**{k: d.get(k, getattr(cls, k, None) if False else "")
                       for k in ["path", "size", "mtime", "sha256", "content_b64", "existed"]})
 

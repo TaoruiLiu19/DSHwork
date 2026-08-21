@@ -1,27 +1,23 @@
-"""主窗口：TRAE Work 风格布局。
+"""主窗口：Web 版 AppFrame 布局（对齐 DSH Web UI）。
 
 布局结构：
 ┌─────────────────────────────────────────────────┐
-│  TopStrip (36px): 工作区 | 模型选择 | 新建会话    │
-├──────┬────────┬─────────────────┬───────────────┤
-│      │        │                 │               │
-│  A   │ 二级   │  对话/工作区     │  预览/工具    │
-│  c   │ 面板   │  (消息流+输入)   │               │
-│  t   │        │                 │               │
-│  B   │        │                 │               │
-│  a   │        │                 │               │
-│  r   │        │                 │               │
-│      │        │                 │               │
-├──────┴────────┴─────────────────┴───────────────┤
-│  StatusBar (24px): 连接 | Agent | 上下文 | 版本   │
+│  TitleBar: 工作区 | DSH Work | preset | 模型     │
+├────────┬──────────────────────────┬──────────────┤
+│        │ ConversationHeader       │              │
+│ Sidebar│ (会话标题 + 视图 + 新建)  │   Details    │
+│ (会话/ │                          │   (预览/工   │
+│  文件/ │  ChatView（消息流）       │    具调用,    │
+│  搜索/ │  余额小部件               │    默认关闭)  │
+│  Git)  │  Composer（输入条）       │              │
+├────────┴──────────────────────────┴──────────────┤
+│  StatusBar: 连接 | Agent | 上下文 | 模式 | 余额    │
 └─────────────────────────────────────────────────┘
 
-- ActivityBar (48px): 图标导航 + 模式切换 + 设置
-- 二级面板 (200px): 会话/文件/搜索/Git（由 ActivityBar 控制）
-- 中栏 (flex): 消息流 + 输入框
-- 右栏 (220px): 预览/工具调用
-
-快捷键体系不变。
+- 左栏 WebSidebar: 顶部导航（会话/文件/搜索/Git）+ 会话列表 + 底部设置
+- 中央对话列: ConversationHeader + 消息流 + Composer；用量面板经头部视图切换
+- 右栏 Details: 预览/工具调用，默认关闭
+- 快捷键体系不变。
 """
 
 from __future__ import annotations
@@ -30,32 +26,31 @@ import json
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QTimer, QObject
-from PySide6.QtGui import QKeySequence, QShortcut, QCloseEvent
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QSplitter,
     QApplication,
-    QTabWidget,
+    QHBoxLayout,
+    QMainWindow,
+    QSplitter,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 from .. import constants as C
 from ..api import CompatibilityMode, DshService
 from ..config import UserConfig
 from ..core.mode_state import Mode, ModeManager
-from ..core.session_manager import SessionManager, AgentStatus
+from ..core.session_manager import AgentStatus, SessionManager
 from ..utils.logger import get_logger
-from .panels.left_panel import LeftPanel
 from .panels.center_panel import CenterPanel
+from .panels.left_panel import LeftPanel
 from .panels.right_panel import RightPanel
 from .panels.usage_panel import UsagePanel
 from .status_bar import StatusBar
 from .system_tray import SystemTray
 from .title_bar import TitleBar
-from .widgets.activity_bar import ActivityBar
 
 log = get_logger("ui.main_window")
 
@@ -113,10 +108,12 @@ class MainWindow(QMainWindow):
 
         # UI 组件
         self.title_bar = TitleBar(self)
-        self.activity_bar = ActivityBar(self)
         self.left_panel = LeftPanel(self)
         self.center_panel = CenterPanel(self)
-        self.usage_panel = UsagePanel(self.dsh.usage, self.dsh.balance)
+        self.usage_panel = UsagePanel(
+            self.dsh.usage, self.dsh.balance,
+            default_model=getattr(self.dsh, "default_model", "") or "",
+        )
         self.right_panel = RightPanel(self)
         self.status_bar = StatusBar(self)
 
@@ -145,45 +142,44 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 600)
 
     def _setup_layout(self) -> None:
-        """TRAE Work 风格布局：TopStrip | (ActivityBar + Splitter) | StatusBar。"""
+        """Web 版 AppFrame 布局：TitleBar | (Sidebar + Splitter(对话列, Details)) | StatusBar。
+
+        中央对话列 = QStackedWidget(CenterPanel 对话 / UsagePanel 用量)，由
+        ConversationHeader 的视图按钮切换（对齐 Web 版 view tabs）。
+        """
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 顶部极简栏
+        # 顶部栏
         main_layout.addWidget(self.title_bar)
 
-        # 中间区域：ActivityBar + 三栏 Splitter
+        # 中间区域：Sidebar + 三栏 Splitter
         mid_layout = QHBoxLayout()
         mid_layout.setContentsMargins(0, 0, 0, 0)
         mid_layout.setSpacing(0)
-
-        # ActivityBar（固定窄边栏）
-        mid_layout.addWidget(self.activity_bar)
 
         # 三栏分割器
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(self.left_panel)
 
-        # 中心 Tab：「对话」 / 「用量与消耗」（与 DSH WebUI 的 Tab 体系一致）
-        self._center_tabs = QTabWidget()
-        # 不用 documentMode：Windows 下 documentMode 会启用原生绘制，导致 Tab 栏背景白色、不受 QSS 控制
-        self._center_tabs.setTabPosition(QTabWidget.TabPosition.North)
-        # Tab 样式由 _on_theme_changed 主题监听器直接 setStyleSheet，随主题切换
-        self._center_tabs.addTab(self.center_panel, "💬 对话")
-        self._center_tabs.addTab(self.usage_panel, "📊 用量与消耗")
-        self._splitter.addWidget(self._center_tabs)
+        # 中央堆叠：「对话」 / 「用量与消耗」（对齐 Web 版 view tabs）
+        self._center_stack = QStackedWidget()
+        self._center_stack.addWidget(self.center_panel)
+        self._center_stack.addWidget(self.usage_panel)
+        self._center_stack.setCurrentWidget(self.center_panel)
+        self._splitter.addWidget(self._center_stack)
 
         self._splitter.addWidget(self.right_panel)
 
-        # 应用面板宽度比例（二级面板更窄，中栏更宽）
+        # 应用面板宽度比例
         ratios = self.config.panel_ratios
-        total_width = self.width() - 48  # 减去 ActivityBar 宽度
+        total_width = self.width()
         self._splitter.setSizes([
-            int(total_width * ratios.get("left", 0.16)),
-            int(total_width * ratios.get("center", 0.62)),
+            int(total_width * ratios.get("left", 0.20)),
+            int(total_width * ratios.get("center", 0.58)),
             int(total_width * ratios.get("right", 0.22)),
         ])
         self._splitter.splitterMoved.connect(self._on_splitter_moved)
@@ -197,6 +193,22 @@ class MainWindow(QMainWindow):
 
         # 底部状态栏
         main_layout.addWidget(self.status_bar)
+
+        # ConversationHeader 视图切换：对话 / 用量
+        self.center_panel.usage_requested.connect(
+            lambda: self._center_stack.setCurrentWidget(self.usage_panel)
+        )
+        self.center_panel.conversation_requested.connect(
+            lambda: self._center_stack.setCurrentWidget(self.center_panel)
+        )
+        self.center_panel.new_session_requested.connect(self._action_new_session)
+        # 用量面板返回按钮 → 回到对话（并复位头部高亮）
+        self.usage_panel.back_requested.connect(self._back_to_conversation)
+
+    def _back_to_conversation(self) -> None:
+        """从用量面板返回对话视图。"""
+        self._center_stack.setCurrentWidget(self.center_panel)
+        self.center_panel.set_header_active_view("conversation")
 
     def _setup_shortcuts(self) -> None:
         self._add_shortcut("Ctrl+N", self._action_new_session)
@@ -214,15 +226,17 @@ class MainWindow(QMainWindow):
         shortcut.activated.connect(callback)
 
     def _connect_signals(self) -> None:
-        # 顶栏：Agent Preset 切换 + 模型选择 + 工作区
+        # 顶栏：Agent Preset 切换 + 模型选择 + 工作区 + 主题/设置
         self.title_bar.preset_changed.connect(self._on_preset_changed)
         self.title_bar.model_changed.connect(self._on_model_changed)
         self.title_bar.workspace_clicked.connect(self._action_change_workspace)
+        self.title_bar.theme_clicked.connect(self._action_toggle_theme)
+        self.title_bar.settings_clicked.connect(self._action_open_settings)
 
-        # ActivityBar（导航 + 设置 + 主题）
-        self.activity_bar.nav_changed.connect(self._on_nav_changed)
-        self.activity_bar.settings_clicked.connect(self._action_open_settings)
-        self.activity_bar.theme_clicked.connect(self._action_toggle_theme)
+        # 左栏（Web Sidebar）：导航 + 设置 + 新建会话
+        self.left_panel.nav_requested.connect(self._on_nav_changed)
+        self.left_panel.settings_requested.connect(self._action_open_settings)
+        self.left_panel.new_session_requested.connect(self._action_new_session)
 
         # 中栏
         self.center_panel.send_requested.connect(self._on_send)
@@ -304,6 +318,58 @@ class MainWindow(QMainWindow):
             lambda: self._query_balance_async(force=False),
         )
 
+        # 会话列表定时同步：Web 版/其他客户端新建、删除、改名会话时自动可见
+        # （DSH 是唯一事实源，RPC session.list 较重（含 projections），30 秒一轮）
+        self._sessions_sync_timer = QTimer(self)
+        self._sessions_sync_timer.timeout.connect(self._sync_sessions_quiet)
+        self._sessions_sync_timer.start(30000)
+
+    def _sync_sessions_quiet(self) -> None:
+        """静默同步会话列表（不打扰用户：不弹提示、不切换当前会话）。"""
+        if self.dsh is None or self.dsh.is_offline:
+            return
+        try:
+            current = self.session_manager.current_session_id
+            self.refresh_sessions()
+            # 刷新当前会话统计（StatsDock / TodoDock 数据源）
+            cur = self.session_manager.current_session
+            if cur is not None:
+                self.center_panel.set_session_stats(getattr(cur.info, "projections", None) or {})
+            # 若当前会话被外部删除，回到空状态
+            if current and current not in self.session_manager.sessions:
+                self.center_panel.clear_messages()
+                self.center_panel.set_session_title("新会话")
+                self.center_panel.set_session_stats(None)
+        except Exception as e:
+            log.debug("会话列表静默同步失败(不致命): %s", e)
+
+    def _replay_advanced_state(self, session_id: str) -> None:
+        """切换会话后：从 session.jsonl.zstd 回放高级交互状态（计划/审批）。"""
+        if self.dsh is None or self.dsh.is_offline:
+            return
+        try:
+            from ..core.session_log import latest_todos, read_full_record
+            rec = read_full_record(session_id)
+            # 计划条回放（Web 版 TodoDock：最新 todo/write 且其后无 turn/start）
+            todos = latest_todos(rec)
+            self.center_panel.set_todos(todos)
+            # 审批回放：最后的 approval/asked 若无对应 decided → 展示审批条
+            pending = None
+            asked_id = None
+            for a in rec.approvals:
+                if a.get("id"):
+                    asked_id = a.get("id")
+                if "outcome" in a:
+                    asked_id = None
+            if asked_id:
+                for a in rec.approvals:
+                    if a.get("id") == asked_id and "outcome" not in a:
+                        pending = a
+                        break
+            self.center_panel.show_approval(pending)
+        except Exception as e:
+            log.debug("高级状态回放失败(不致命): %s", e)
+
     @staticmethod
     def _mode_to_preset(mode: str) -> str:
         """兼容旧 mode 字段（work/code）→ preset id。"""
@@ -314,10 +380,10 @@ class MainWindow(QMainWindow):
         """preset → 面板布局 mode（standard/minimal/cordis→work，code→code）。"""
         return C.MODE_CODE if preset_id == "code" else C.MODE_WORK
 
-    # ===== ActivityBar 导航 =====
+    # ===== 左栏导航 =====
 
     def _on_nav_changed(self, nav: str) -> None:
-        """ActivityBar 导航切换：更新二级面板内容，并自动显示左栏。"""
+        """左栏导航切换：更新二级面板内容，并自动显示左栏。"""
         if not self.left_panel.isVisible():
             self.left_panel.setVisible(True)
             self.config.panel_collapsed["left"] = False
@@ -427,12 +493,16 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.error("新建会话失败: %s", e)
             self.status_bar.show_temporary(
-                "❌ 新建会话失败: %s" % e, color="#FF6B6B", duration_ms=5000
+                f"❌ 新建会话失败: {e}", color="#FF6B6B", duration_ms=5000
             )
 
     def _action_search_sessions(self) -> None:
-        """搜索会话：切换到搜索面板。"""
-        self.activity_bar.set_nav("search")
+        """搜索会话：切换到左栏搜索面板。"""
+        self.left_panel.set_nav("search")
+        if not self.left_panel.isVisible():
+            self.left_panel.setVisible(True)
+            self.config.panel_collapsed["left"] = False
+            self.config.save()
         log.info("切换到搜索面板")
 
     def _on_session_selected(self, session_id: str) -> None:
@@ -445,6 +515,12 @@ class MainWindow(QMainWindow):
         # 切换后渲染历史消息
         state = self.session_manager.current_session
         if state:
+            # 同步对话列头部标题（Web 版 Session Header）
+            self.center_panel.set_session_title(state.info.title or "新对话")
+            # StatsDock 统计条（Web 版 sessionStats）
+            self.center_panel.set_session_stats(getattr(state.info, "projections", None) or {})
+            # 高级交互历史回放（计划/审批，异步避免卡 UI）
+            QTimer.singleShot(0, lambda sid=session_id: self._replay_advanced_state(sid))
             if state.messages:
                 self.center_panel.load_history(state.messages)
             else:
@@ -465,9 +541,9 @@ class MainWindow(QMainWindow):
 
         # ---------- 安全围栏 ----------
         from ..core.safety_guard import (
-            can_open_or_restore,
-            build_roots_from_context,
             DANGEROUS_EXT_DESC,
+            build_roots_from_context,
+            can_open_or_restore,
         )
         session_cwd = ""
         try:
@@ -520,7 +596,7 @@ class MainWindow(QMainWindow):
         self._pending_attachments.extend(files)
         names = ", ".join(f.split("/")[-1].split("\\")[-1] for f in files)
         self.status_bar.show_temporary(
-            "📎 已附加: %s" % names, color="#387BFF", duration_ms=2500
+            f"📎 已附加: {names}", color="#387BFF", duration_ms=2500
         )
         log.info("附件暂存: %s", files)
 
@@ -636,12 +712,45 @@ class MainWindow(QMainWindow):
                     self.center_panel.start_streaming()
                 self.center_panel.append_chunk(chunk)
 
+        elif event_type == "reasoning":
+            # 思考增量（reasoning-delta）→ 更新 ThinkRow 实时摘要
+            r = data.get("reasoning", "")
+            if r:
+                self.center_panel.update_think(r)
+
+        elif event_type == "context_row":
+            # 上下文注入行（Web 版 ContextRow）
+            self.center_panel.add_context_row(
+                data.get("label", "上下文注入"), data.get("content", "")
+            )
+
+        elif event_type == "todo_write":
+            # 计划条（Web 版 TodoDock）
+            self.center_panel.set_todos(data.get("todos"))
+
+        elif event_type == "queue_spliced":
+            # 排队消息条（Web 版 QueueDock）
+            self.center_panel.set_queue(data.get("inserted"))
+
+        elif event_type == "approval_asked":
+            # 审批条（Web 版 ApprovalPanel）
+            self.center_panel.show_approval(data)
+
+        elif event_type == "approval_decided":
+            # 审批已处理（放行/拒绝）
+            self.center_panel.hide_approval()
+
+        elif event_type == "approval_policy":
+            pass  # 策略信息无需 UI
+
         elif event_type == "turn_start":
-            # 新一轮开始：确保有流式气泡
+            # 新一轮开始：确保有流式气泡 + 思考行（Web 版 ThinkRow）+ 思考中提示
             log.info("[DEBUG] turn_start事件: is_streaming=%s", self.center_panel.is_streaming())
             if not self.center_panel.is_streaming():
                 log.info("[DEBUG] turn_start: 无流式气泡，创建新气泡")
                 self.center_panel.start_streaming()
+            self.center_panel.start_think()
+            self.center_panel.set_streaming_hint("思考中…")
 
         elif event_type == "turn_end":
             # 一轮结束：定稿流式气泡
@@ -650,15 +759,34 @@ class MainWindow(QMainWindow):
                      self.center_panel.is_streaming(),
                      "有内容" if finalized and getattr(finalized, "content", "") else "None/空")
             if self.center_panel.is_streaming():
-                self.center_panel.finish_streaming()
-                # 若本轮无任何内容（空回复），把气泡内容设为占位提示
-                if finalized is None:
+                row = self.center_panel.finish_streaming()
+                if finalized is not None and getattr(finalized, "content", ""):
+                    # 以 DSH turn_end 的完整消息为权威内容补齐流式行：
+                    # 流式 chunk 可能未到达（一次性回复 / WS 事件丢失 / 兜底轮询路径），
+                    # 若只固化空流式行会导致回复不显示（界面停留在上一轮）。
+                    if row is not None:
+                        row.update_content(finalized.content)
+                elif finalized is None:
                     log.info("[DEBUG] turn_end: 无最终消息，填充占位")
                     self.center_panel.fill_prompt("")  # 仅刷新布局
             elif finalized is not None:
                 # 无流式气泡但有固化消息（重连后收到 turn_end）：直接添加
                 log.info("[DEBUG] turn_end: 无流式气泡但有固化消息，直接添加")
                 self.center_panel.add_message(finalized)
+            # 清理思考状态提示
+            self.center_panel.set_streaming_hint(None)
+            # 固化思考行（Web 版 ThinkRow：已思考）
+            self.center_panel.finish_think(data.get("reasoning"))
+            # turn tail 统计（Web 版 assistant footer：本轮 tokens）
+            prompt_tok = getattr(state.context, "prompt_tokens", 0) or 0
+            comp_tok = getattr(state.context, "completion_tokens", 0) or 0
+            meta_parts = []
+            if prompt_tok or comp_tok:
+                meta_parts.append(f"本轮输入 {prompt_tok} · 输出 {comp_tok} tokens")
+            if state.last_turn_cost:
+                meta_parts.append(f"约 ¥{state.last_turn_cost:.4f}")
+            if meta_parts:
+                self.center_panel.set_last_assistant_meta(" · ".join(meta_parts))
             # 对话结束：后台异步刷新余额（非强制，命中5分钟缓存则零开销）
             self._query_balance_async(force=False)
 
@@ -668,6 +796,8 @@ class MainWindow(QMainWindow):
             self.center_panel.on_tool_call(tool_name, params)
             # 右栏 Code 模式时间线同步
             self.right_panel.add_tool_call(tool_name, "running", 0)
+            # 流式行状态提示：工具执行中
+            self.center_panel.set_streaming_hint(f"工具执行中… {tool_name}")
 
         elif event_type == "tool_result":
             tool_name = data.get("tool_name", "")
@@ -680,6 +810,8 @@ class MainWindow(QMainWindow):
             # 若工具产生 diff 文本，同步到 DiffView
             if isinstance(result, str) and ("\n+" in result or "\n-" in result):
                 self.right_panel.show_diff(result)
+            # 工具结束：恢复「思考中…」提示
+            self.center_panel.set_streaming_hint("思考中…")
 
         elif event_type == "error":
             # 错误：定稿未完成的流式气泡，避免界面留白
@@ -687,7 +819,7 @@ class MainWindow(QMainWindow):
                 self.center_panel.finish_streaming()
             err_msg = data.get("message") or data.get("error") or "发生未知错误"
             self.status_bar.show_temporary(
-                "⚠️ %s" % err_msg, color="#F65A5A", duration_ms=5000
+                f"⚠️ {err_msg}", color="#F65A5A", duration_ms=5000
             )
 
         elif event_type == "history_sync":
@@ -696,7 +828,7 @@ class MainWindow(QMainWindow):
             added = data.get("added", 0)
             if added:
                 self.status_bar.show_temporary(
-                    "🔄 已恢复 %d 条断线消息" % added, color="#387BFF", duration_ms=3000
+                    f"🔄 已恢复 {added} 条断线消息", color="#387BFF", duration_ms=3000
                 )
 
     # ===== 消息发送 =====
@@ -769,8 +901,9 @@ class MainWindow(QMainWindow):
                 return
 
         # ---- 检查通过，执行发送 ----
-        from ..api import MessageRecord
         import time as _time
+
+        from ..api import MessageRecord
 
         local_msg = MessageRecord(role="user", content=text, timestamp=_time.time())
         self.center_panel.add_message(local_msg)
@@ -823,7 +956,7 @@ class MainWindow(QMainWindow):
 
         log.warning("[防呆] 阻止发送: %s reason=%s", title, reason)
         self.status_bar.show_temporary(
-            "⚠️ %s" % title, color="#F65A5A", duration_ms=4000
+            f"⚠️ {title}", color="#F65A5A", duration_ms=4000
         )
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
@@ -895,30 +1028,12 @@ class MainWindow(QMainWindow):
     # ===== 主题 =====
 
     def _on_theme_changed(self, theme) -> None:
-        """主题切换监听器：直接刷新中心 Tab 样式。"""
+        """主题切换监听器：中央堆叠为 QStackedWidget，样式跟随全局 QSS，
+        无需额外处理；仅保留兼容（旧实现刷新中心 Tab 样式，已随 Tab 壳移除）。"""
         c = theme.colors
-        self._center_tabs.setStyleSheet(f"""
-            QTabWidget {{ background-color: {c.bg_primary}; border: none; }}
-            QTabWidget::pane {{ border: none; background-color: {c.bg_primary}; top: 0; }}
-            QTabBar {{ background-color: {c.bg_primary}; }}
-            QTabBar::tab {{
-                padding: 8px 20px; font-size: 13px;
-                color: {c.text_secondary};
-                background: transparent;
-                border: none;
-                border-bottom: 2px solid transparent;
-                min-height: 32px;
-            }}
-            QTabBar::tab:selected {{
-                color: {c.accent};
-                border-bottom-color: {c.accent};
-                font-weight: 600;
-            }}
-            QTabBar::tab:hover:!selected {{
-                color: {c.text_primary};
-                background-color: {c.bg_hover};
-            }}
-        """)
+        self._center_stack.setStyleSheet(
+            f"QStackedWidget {{ background-color: {c.bg_primary}; border: none; }}"
+        )
 
     def _action_toggle_theme(self) -> None:
         from .theme.theme_manager import ThemeManager
@@ -946,9 +1061,19 @@ class MainWindow(QMainWindow):
 
     def _action_open_settings(self) -> None:
         from PySide6.QtWidgets import (
-            QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
-            QLineEdit, QPushButton, QCheckBox, QComboBox,
-            QGroupBox, QPlainTextEdit, QDialogButtonBox, QWidget,
+            QCheckBox,
+            QComboBox,
+            QDialog,
+            QDialogButtonBox,
+            QFormLayout,
+            QGroupBox,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QPlainTextEdit,
+            QPushButton,
+            QVBoxLayout,
+            QWidget,
         )
 
         log.info("打开设置")
@@ -977,7 +1102,6 @@ class MainWindow(QMainWindow):
         # 主题颜色快捷变量（避免内联 setStyleSheet 使用硬编码颜色）
         _c = _theme.colors if _theme else None
         CLR_SEC = _c.text_secondary if _c else "#9599A6"
-        CLR_MUTE = _c.text_muted if _c else "#666B75"
         CLR_BG2 = _c.bg_secondary if _c else "#222427"
         CLR_WARN = _c.warning if _c else "#D27E24"
         CLR_ERR = _c.error if _c else "#F65A5A"
@@ -1005,13 +1129,15 @@ class MainWindow(QMainWindow):
         grp_key = QGroupBox("DeepSeek API 密钥")
         key_layout = QFormLayout(grp_key)
         key_layout.setSpacing(10)
-        import os, yaml
+        import os
+
+        import yaml
         dsh_home = os.path.join(os.path.expanduser("~"), ".dsh")
         creds_file = os.path.join(dsh_home, ".credentials.yaml")
         current_key = ""
         try:
             if os.path.isfile(creds_file):
-                with open(creds_file, "r", encoding="utf-8") as f:
+                with open(creds_file, encoding="utf-8") as f:
                     creds_data = yaml.safe_load(f) or {}
                 current_key = str(creds_data.get("DEEPSEEK_API_KEY", ""))
         except Exception:
@@ -1045,13 +1171,13 @@ class MainWindow(QMainWindow):
                 import yaml as _yaml_v
                 v_data = {}
                 if os.path.isfile(creds_file):
-                    with open(creds_file, "r", encoding="utf-8") as f:
+                    with open(creds_file, encoding="utf-8") as f:
                         v_data = _yaml_v.safe_load(f) or {}
                 v_data["DEEPSEEK_API_KEY"] = key_to_check
                 with open(creds_file, "w", encoding="utf-8") as f:
                     _yaml_v.dump(v_data, f, default_flow_style=False, allow_unicode=True)
             except Exception as ev:
-                verify_status_lbl.setText("⚠ 写入失败: %s" % ev)
+                verify_status_lbl.setText(f"⚠ 写入失败: {ev}")
                 verify_status_lbl.setStyleSheet(f"color:{CLR_ERR}; font-size:11px;")
                 return
             verify_status_lbl.setText("验证中...")
@@ -1062,7 +1188,7 @@ class MainWindow(QMainWindow):
                 if creds.get("valid"):
                     provider = creds.get("provider", "")
                     extra = f" ({provider})" if provider else ""
-                    verify_status_lbl.setText("✓ Key 有效%s" % extra)
+                    verify_status_lbl.setText(f"✓ Key 有效{extra}")
                     verify_status_lbl.setStyleSheet(f"color:{CLR_OK}; font-size:11px;")
                 elif creds.get("configured"):
                     verify_status_lbl.setText("⚠ Key 已配置但校验未通过")
@@ -1071,7 +1197,7 @@ class MainWindow(QMainWindow):
                     verify_status_lbl.setText("⚠ DSH 未识别到 Key")
                     verify_status_lbl.setStyleSheet(f"color:{CLR_WARN}; font-size:11px;")
             except Exception as ev:
-                verify_status_lbl.setText("⚠ 验证失败: %s" % ev)
+                verify_status_lbl.setText(f"⚠ 验证失败: {ev}")
                 verify_status_lbl.setStyleSheet(f"color:{CLR_ERR}; font-size:11px;")
         verify_btn.clicked.connect(do_verify)
         verify_row.addWidget(verify_btn)
@@ -1184,7 +1310,7 @@ class MainWindow(QMainWindow):
                     import yaml as _yaml
                     creds_data = {}
                     if os.path.isfile(creds_file):
-                        with open(creds_file, "r", encoding="utf-8") as f:
+                        with open(creds_file, encoding="utf-8") as f:
                             creds_data = _yaml.safe_load(f) or {}
                     if new_key:
                         creds_data["DEEPSEEK_API_KEY"] = new_key
@@ -1290,7 +1416,8 @@ class MainWindow(QMainWindow):
         self._quit_triggered = True
         # 退出前保存对话
         self._save_conversation_state()
-        import traceback, sys as _sys
+        import sys as _sys
+        import traceback
         stack = "".join(traceback.format_stack()[:-1])
         # 用 warning 级别确保调用栈可见（info 级别可能被日志配置截断）
         log.warning("DSH Work 正在退出... 调用栈:\n%s", stack)
@@ -1361,7 +1488,7 @@ class MainWindow(QMainWindow):
             if not messages:
                 return
             # 通过 session_manager 创建或恢复会话
-            from ..api.dsh_service import SessionInfo, MessageRecord
+            from ..api.dsh_service import MessageRecord, SessionInfo
             # 先尝试找 DSH 侧同 ID 的会话
             existing = self.session_manager.sessions.get(session_id)
             state = existing
@@ -1471,13 +1598,33 @@ class MainWindow(QMainWindow):
             self.title_bar.set_models(["[错误] 刷新失败"], "")
             self.title_bar._model_combo.setEnabled(False)
 
+    def _session_status_map(self) -> dict:
+        """派生会话状态点映射（对齐 Web 版：running=蓝 / pending=琥珀 / done=绿）。
+
+        - Agent 运行/思考/工具执行 → running
+        - 出错 → pending（琥珀，需关注）
+        - 最近一轮对话正常结束 → done
+        """
+        status_map: dict[str, str] = {}
+        for sid, state in self.session_manager.sessions.items():
+            st = getattr(state, "agent_status", None)
+            status = "idle"
+            if st in (AgentStatus.RUNNING, AgentStatus.THINKING, AgentStatus.TOOL_EXECUTING):
+                status = "running"
+            elif st == AgentStatus.ERROR:
+                status = "pending"
+            elif getattr(state, "last_event_type", "") == "turn_end":
+                status = "done"
+            status_map[sid] = status
+        return status_map
+
     def refresh_sessions(self) -> None:
         try:
             import asyncio
             loop = asyncio.new_event_loop()
             try:
                 infos = loop.run_until_complete(self.session_manager.refresh_sessions())
-                self.left_panel.refresh_sessions(infos)
+                self.left_panel.refresh_sessions(infos, status_map=self._session_status_map())
             finally:
                 loop.close()
         except Exception as e:

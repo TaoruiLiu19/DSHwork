@@ -11,7 +11,6 @@ import os
 import sys
 from pathlib import Path
 
-
 _APP_NAME = "DSHWork"
 
 

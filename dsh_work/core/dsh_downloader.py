@@ -23,8 +23,8 @@ import subprocess
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 from .. import constants as C
 from ..config import get_runtime_dir
@@ -70,7 +70,7 @@ def _node_archive_url() -> str:
     return f"{C.NODE_DIST_BASE}/{ver}/node-{ver}-{tag}.tar.xz"
 
 
-def get_node_bin() -> Optional[Path]:
+def get_node_bin() -> Path | None:
     """便携 node 可执行文件路径，未安装返回 None。"""
     d = get_node_dir()
     if not d.is_dir():
@@ -79,7 +79,7 @@ def get_node_bin() -> Optional[Path]:
     return exe if exe.is_file() else None
 
 
-def get_npm_cli_js() -> Optional[Path]:
+def get_npm_cli_js() -> Path | None:
     """便携包内置 npm 的 cli 入口 JS，未安装返回 None。"""
     d = get_node_dir()
     if not d.is_dir():
@@ -88,7 +88,7 @@ def get_npm_cli_js() -> Optional[Path]:
     return p if p.is_file() else None
 
 
-def get_local_dsh_entry() -> Optional[Path]:
+def get_local_dsh_entry() -> Path | None:
     """本地安装的 dsh 入口 JS（读 package.json 的 bin 字段定位），未安装返回 None。"""
     pkg_dir = get_runtime_dir() / "node_modules" / C.DSH_CLI_PACKAGE
     pkg_json = pkg_dir / "package.json"
@@ -97,7 +97,7 @@ def get_local_dsh_entry() -> Optional[Path]:
     try:
         data = json.loads(pkg_json.read_text(encoding="utf-8"))
         bin_field = data.get("bin")
-        target: Optional[str] = None
+        target: str | None = None
         if isinstance(bin_field, str):
             target = bin_field
         elif isinstance(bin_field, dict):
@@ -112,7 +112,7 @@ def get_local_dsh_entry() -> Optional[Path]:
         return None
 
 
-def get_dsh_command() -> Optional[list[str]]:
+def get_dsh_command() -> list[str] | None:
     """返回用本地便携运行时启动 dsh 的命令，未就绪返回 None。"""
     node = get_node_bin()
     if not node:
@@ -133,7 +133,7 @@ def is_runtime_ready() -> bool:
 
 
 def _download(url: str, dest: Path, log_cb: LogCb, timeout: int,
-              progress_cb: Optional[ProgressCb] = None) -> bool:
+              progress_cb: ProgressCb | None = None) -> bool:
     """流式下载并显示进度，下载到 .part 再原子重命名。
 
     progress_cb(done_bytes, total_bytes)：每写入一个 chunk 调用一次，
@@ -210,7 +210,7 @@ def _flatten(node_dir: Path, log_cb: LogCb) -> None:
 
 
 def download_portable_node(log_cb: LogCb,
-                           progress_cb: Optional[ProgressCb] = None) -> Optional[Path]:
+                           progress_cb: ProgressCb | None = None) -> Path | None:
     """下载并解压便携 Node.js，返回 node 可执行文件路径，失败返回 None。"""
     if get_node_bin():
         log_cb(f"便携 Node 已存在: {get_node_dir()}")
@@ -362,7 +362,7 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 def ensure_runtime(log_cb: LogCb,
-                   progress_cb: Optional[ProgressCb] = None) -> Optional[list[str]]:
+                   progress_cb: ProgressCb | None = None) -> list[str] | None:
     """确保本地运行时就绪（缺则下载/安装），返回 dsh 启动命令或 None。"""
     cmd = get_dsh_command()
     if cmd:

@@ -17,15 +17,14 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import (
     QAction,
-    QIcon,
-    QPixmap,
     QColor,
+    QIcon,
     QPainter,
+    QPixmap,
 )
-from PySide6.QtWidgets import QMenu, QApplication, QSystemTrayIcon
+from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from ..core.session_manager import AgentStatus
-from .. import constants as C
 from ..utils.logger import get_logger
 
 log = get_logger("ui.system_tray")

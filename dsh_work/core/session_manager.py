@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .. import constants as C
+
 # 直接从子模块导入，避免走 api/__init__.py → dsh_service → core/__init__.py 的循环链路
 from ..api.dsh_service import DshService, MessageRecord, SessionInfo
-from ..api.ws_client import WSMessage, WSEventType
+from ..api.ws_client import WSEventType, WSMessage
 from ..utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -122,6 +124,15 @@ class SessionState:
     last_turn_cost: float = 0.0
     # 本会话累计消耗（元），切换会话时归零
     session_total_cost: float = 0.0
+    # 本 Turn 的思考内容（reasoning 块累积，Web 版 ThinkRow 数据源）
+    pending_reasoning: str = ""
+    # 本 Turn 的队列/计划/审批快照（Web 版高级交互数据源）
+    pending_todos: list[dict] = field(default_factory=list)
+    pending_queue: list[dict] = field(default_factory=list)
+    pending_approval: dict | None = None
+    # 兜底轮询锚点：发送消息 / turn_start 时记录，_poll_once 只接受其后产生的消息
+    # （防止 Agent 忙时消息被排队、轮询把上一个 turn 的旧回复当本轮显示）
+    _poll_anchor_ts: float = 0.0
     # 消息时间戳索引：加速历史增量去重（O(1) 查询 vs 全表扫描）
     _msg_ts_index: set[float] = field(default_factory=set)
     # 文件变更追踪器（首次调用 snapshot_files 时懒加载）
@@ -250,41 +261,49 @@ class SessionManager:
         if not hist:
             return
 
+        # 锚点过滤：只接受轮询启动后产生的消息。
+        # 场景：Agent 忙时用户新消息被排队（无新 turn），此时 history 里仍含
+        # 上一个 turn 的 assistant 回复；若不过滤，轮询会把旧回复当作本轮
+        # 结束显示，造成"回复是上一个问题的"。
+        anchor = getattr(state, "_poll_anchor_ts", 0.0)
+        if anchor > 0:
+            hist = [m for m in hist if m.timestamp >= anchor - 2.0]
+            if not hist:
+                return
+
         # ---- 二次检查：get_history() 期间 WebSocket 可能已处理完 TURN_END ----
         # 如果 agent 已恢复 IDLE，轮询不再处理，避免与 WebSocket 重复添加消息。
         if state.agent_status == AgentStatus.IDLE:
             self._mark_session_poll_end(session_id)
             return
 
-        # 去重合并
-        added = self._append_messages(state, hist)
-        state.messages.sort(key=lambda m: m.timestamp)
-
-        # 检测 turn 是否结束：最后一条非空 assistant 消息是否存在
-        ended = False
+        # 先检测"本轮结束候选"（hist 里最后一条非空 assistant），
+        # 必须在 _append_messages 之前做去重判断 —— 合并会把消息加入
+        # state.messages，之后再查 already_has 恒为 True，ended 永远不触发。
         finalized: MessageRecord | None = None
         for m in reversed(hist):
             if getattr(m, "role", None) == "assistant" and getattr(m, "content", ""):
                 finalized = m
                 break
-        if finalized is not None:
-            # 内容级去重（不依赖时间戳）：防止 WebSocket TURN_END 已添加的消息被轮询重复添加
-            already_has = any(
-                sm.role == "assistant" and sm.content == finalized.content
-                for sm in state.messages
-            )
-            if not already_has:
-                added.append(finalized)
-                state.messages.append(finalized)
-                state._msg_ts_index.add(finalized.timestamp)
-            # 判定：DSH 侧已经产生了 assistant 消息，我们视为本轮有效结束
-            # （即便 streaming_buffer 未累积到该内容），把它写入 UI，避免 WebSocket 全丢
+        already_has = finalized is not None and any(
+            sm.role == "assistant" and sm.content == finalized.content
+            for sm in state.messages
+        )
+
+        # 去重合并
+        added = self._append_messages(state, hist)
+        state.messages.sort(key=lambda m: m.timestamp)
+
+        # 只有 finalized 是"本轮新增"（合并前 state.messages 中不存在）才算
+        # 本轮有效结束；若内容早已存在（上一个 turn 的回复），不触发 turn_end，
+        # 避免把旧回复补进当前流式行（"回复是上一个问题的"）。
+        ended = False
+        if finalized is not None and not already_has:
             if state.streaming_buffer and finalized.content.startswith(state.streaming_buffer):
                 # WS 收到了一部分，剩下的在历史里：补齐
                 state.streaming_buffer = finalized.content
             elif not state.streaming_buffer:
                 state.streaming_buffer = finalized.content
-            # 标记 ended → 触发一次 turn_end 事件
             ended = True
 
         if added or ended:
@@ -475,6 +494,7 @@ class SessionManager:
         """
         import time
         import uuid
+
         from ..api.dsh_service import SessionInfo
 
         # 1. 正常路径：通过 DSH RPC 创建（含 agentPreset）
@@ -634,6 +654,8 @@ class SessionManager:
             # 空闲：发送新消息
             state.agent_status = AgentStatus.RUNNING
             state.current_turn += 1
+            # 轮询锚点：此后 history 里产生的新消息才属于本轮
+            state._poll_anchor_ts = time.time()
             # 启动兜底轮询：防止 WebSocket 丢事件导致 UI 永不刷新
             self._mark_session_poll_start(self._current_session_id)
             try:
@@ -806,20 +828,33 @@ class SessionManager:
             if state.agent_status == AgentStatus.IDLE:
                 return
 
-            # 流式文本块：追加到 streaming_buffer
-            # msg.data 结构: {'turn': N, 'step': N, 'chunk': {'type': 'text-delta', 'index': N, 'text': '内容'}}
-            # 只从 text-delta 类型提取文本（block-end 包含完整文本，会和 text-delta 重复）
+            # 流式文本块：text-delta → 正文缓冲；reasoning-delta → 思考缓冲（ThinkRow）
+            # msg.data 结构: {'turn': N, 'step': N, 'chunk': {'type': 'text-delta'|'reasoning-delta'|..., 'text': '...'}}
+            # 只从 text-delta / reasoning-delta 提取（block-end 含完整文本，会与 delta 重复）
             chunk_text = ""
+            reasoning_text = ""
             chunk_data = msg.data.get("chunk", {})
-            if isinstance(chunk_data, dict) and chunk_data.get("type") == "text-delta":
-                chunk_text = chunk_data.get("text", "")
-            chunk_text = str(chunk_text) if chunk_text else ""
+            if isinstance(chunk_data, dict):
+                ctype = chunk_data.get("type")
+                raw = chunk_data.get("text", "")
+                if ctype == "text-delta":
+                    chunk_text = str(raw) if raw else ""
+                elif ctype == "reasoning-delta":
+                    reasoning_text = str(raw) if raw else ""
             state.streaming_buffer += chunk_text
+            if reasoning_text:
+                state.pending_reasoning += reasoning_text
             state.agent_status = AgentStatus.THINKING
-            state.last_event_type = "chunk"
-            state.last_event_data = {"chunk": chunk_text}
-            # 优化：CHUNK 节流，30ms 合并一次 UI 刷新（避免每个小 chunk 都重绘）
-            self._notify_chunk(msg.session_id)
+            if chunk_text:
+                state.last_event_type = "chunk"
+                state.last_event_data = {"chunk": chunk_text}
+                # 优化：CHUNK 节流，30ms 合并一次 UI 刷新（避免每个小 chunk 都重绘）
+                self._notify_chunk(msg.session_id)
+            if reasoning_text:
+                # 思考增量单独通知（UI 更新 ThinkRow 实时摘要）
+                state.last_event_type = "reasoning"
+                state.last_event_data = {"reasoning": reasoning_text}
+                self._notify(msg.session_id)
 
         elif msg.event_type == WSEventType.TURN_START:
             # 取消后防护：如果 Agent 已被用户停止，忽略新的 TURN_START
@@ -828,6 +863,9 @@ class SessionManager:
             state.agent_status = AgentStatus.RUNNING
             state.current_turn = msg.data.get("turn", state.current_turn + 1)
             state.streaming_buffer = ""
+            state.pending_reasoning = ""
+            # 轮询锚点：新一轮开始，此后产生的消息才属于本轮
+            state._poll_anchor_ts = time.time()
             state.last_event_type = "turn_start"
             state.last_event_data = {}
             # 启动兜底轮询（防止 WebSocket 后续 chunk/turn_end 全丢）
@@ -870,7 +908,13 @@ class SessionManager:
             if snap:
                 try:
                     if hasattr(self.dsh, "usage") and self.dsh.usage is not None:
-                        model = snap.get("model") or getattr(state.info, "model", "") or ""
+                        # model 兜底链：TOKEN_USAGE 事件 → 会话当前模型 → DSH 默认模型
+                        model = (
+                            snap.get("model")
+                            or getattr(state.info, "model", "")
+                            or getattr(self.dsh, "default_model", "")
+                            or ""
+                        )
                         provider = snap.get("provider") or state.pending_provider or ""
                         purpose = snap.get("purpose") or state.pending_purpose or ""
                         # 记录时间：优先取事件 msg.timestamp（秒级）转 ms，否则当前
@@ -900,7 +944,15 @@ class SessionManager:
             state.session_total_cost += turn_cost
             state.agent_status = AgentStatus.IDLE
             state.last_event_type = "turn_end"
-            state.last_event_data = {"message": finalized_msg}
+            # 携带本轮思考内容（UI 固化 ThinkRow 用），随后清空
+            turn_reasoning = state.pending_reasoning
+            state.pending_reasoning = ""
+            state.last_event_data = {
+                "message": finalized_msg,
+                "reasoning": turn_reasoning,
+                "todos": list(state.pending_todos),
+                "approval": state.pending_approval,
+            }
 
             # 文件变更追踪：TURN_END 后自动检测本轮文件变化（仅当有基线时）
             self._auto_scan_file_changes_after_turn(msg.session_id)
@@ -1193,6 +1245,76 @@ class SessionManager:
             log.error("会话错误 session=%s: %s", msg.session_id, msg.data)
             state.last_event_type = "error"
             state.last_event_data = dict(msg.data) if isinstance(msg.data, dict) else {}
+            self._notify(msg.session_id)
+
+        # ===== Web 版高级交互事件 =====
+
+        elif msg.event_type == WSEventType.TODO_WRITE:
+            # 计划更新（TodoDock 数据源）
+            todos = msg.data.get("todos") if isinstance(msg.data.get("todos"), list) else []
+            state.pending_todos = [t for t in todos if isinstance(t, dict)]
+            state.last_event_type = "todo_write"
+            state.last_event_data = {"todos": state.pending_todos}
+            self._notify(msg.session_id)
+
+        elif msg.event_type == WSEventType.APPROVAL_POLICY:
+            # 审批策略（ask / 其它）
+            state.last_event_type = "approval_policy"
+            state.last_event_data = dict(msg.data) if isinstance(msg.data, dict) else {}
+            self._notify(msg.session_id)
+
+        elif msg.event_type == WSEventType.APPROVAL_ASKED:
+            # 审批请求（ApprovalPanel 数据源）
+            state.pending_approval = dict(msg.data) if isinstance(msg.data, dict) else {}
+            state.agent_status = AgentStatus.THINKING
+            state.last_event_type = "approval_asked"
+            state.last_event_data = state.pending_approval
+            self._notify(msg.session_id)
+
+        elif msg.event_type == WSEventType.APPROVAL_DECIDED:
+            # 审批结果（放行/拒绝）
+            state.pending_approval = None
+            state.last_event_type = "approval_decided"
+            state.last_event_data = dict(msg.data) if isinstance(msg.data, dict) else {}
+            self._notify(msg.session_id)
+
+        elif msg.event_type == WSEventType.QUEUE_SPLICED:
+            # 队列/steer 变更（QueueDock 数据源）
+            state.pending_queue.append(dict(msg.data) if isinstance(msg.data, dict) else {})
+            state.last_event_type = "queue_spliced"
+            state.last_event_data = dict(msg.data) if isinstance(msg.data, dict) else {}
+            self._notify(msg.session_id)
+
+        elif msg.event_type == WSEventType.GOAL_CHANGE:
+            state.last_event_type = "goal_change"
+            state.last_event_data = dict(msg.data) if isinstance(msg.data, dict) else {}
+            self._notify(msg.session_id)
+
+        elif msg.event_type == WSEventType.USER_MESSAGE:
+            # 用户/注入消息：source.kind 区分来源（user=本人；其它=上下文注入/召回）
+            data = dict(msg.data) if isinstance(msg.data, dict) else {}
+            source = data.get("source") if isinstance(data.get("source"), dict) else {}
+            kind = str(source.get("kind") or "user")
+            if kind == "user":
+                # 普通用户消息：由消息流正常渲染（一般已通过 user/message 事件处理）
+                return
+            # 上下文注入行（Web 版 ContextRow）
+            text = ""
+            content = data.get("content")
+            if isinstance(content, list):
+                texts = []
+                for b in content:
+                    if isinstance(b, dict) and isinstance(b.get("text"), str):
+                        texts.append(b["text"])
+                text = "\n".join(texts)
+            label = {
+                "injection": "上下文注入",
+                "recall": "跨会话召回",
+                "skill": "技能加载",
+                "workspace": "工作区上下文",
+            }.get(kind, f"上下文（{kind}）")
+            state.last_event_type = "context_row"
+            state.last_event_data = {"label": label, "content": text}
             self._notify(msg.session_id)
 
     # ===== 离线缓存持久化（第 8.4 节）=====

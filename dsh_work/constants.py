@@ -7,7 +7,7 @@ from __future__ import annotations
 
 # ===== 应用元信息 =====
 APP_NAME = "DSH Work"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.6.0"
 ORG_NAME = "DSH Work"
 ORG_DOMAIN = "dsh.work"
 
@@ -136,8 +136,8 @@ LOG_BACKUP_COUNT = 7             # 保留 7 天
 
 # ===== 主题 =====
 THEMES_DIRNAME = "themes"
-BUILTIN_THEMES = ["midnight_ocean", "daylight", "forest_green"]
-DEFAULT_THEME = "midnight_ocean"
+BUILTIN_THEMES = ["web_dark", "web_light"]
+DEFAULT_THEME = "web_dark"
 
 # ===== 用户配置文件名 =====
 USER_CONFIG_FILENAME = "config.json"

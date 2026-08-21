@@ -99,3 +99,6 @@ build-pyinstaller.log
 # 便携运行时本地缓存（开发期偶尔会放这里调试）
 runtime/
 node/
+
+# 本地冒烟测试残留目录（测试时生成的临时 HOME，不应入库）
+.smoke_home*/

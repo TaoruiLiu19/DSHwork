@@ -122,9 +122,10 @@ def export_diagnostics_bundle(target_path: Path) -> Path:
 
     供帮助菜单"一键导出诊断日志"使用。
     """
-    import zipfile
     import json
-    from ..config import UserConfig, get_app_data_dir
+    import zipfile
+
+    from ..config import UserConfig
 
     bundle = target_path / f"dsh-work-diagnostics-{__import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:

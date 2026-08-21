@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsh-work"
-version = "0.1.0"
+version = "0.6.0"
 description = "DSH Work — AI 原生桌面工作台，为 DSH (DeepSeek Harness) 提供 Work/Code 双模式原生体验"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,7 +24,7 @@ dependencies = [
 dev = [
     "pytest>=7.4",
     "pytest-qt>=4.3",
-    "ruff>=0.4.0",
+    "ruff>=0.5.0",
     "pyinstaller>=6.0",
 ]
 
@@ -38,10 +38,16 @@ include = ["dsh_work*"]
 [tool.setuptools.package-data]
 "dsh_work" = ["resources/themes/*.json", "resources/i18n/*.ts"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# tests/ 目录导入项目包
+pythonpath = ["."]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]
-ignore = ["E501"]
+ignore = ["E501", "UP017", "UP042"]  # UP017 与旧版 ruff 的 F821 对 datetime.UTC 冲突；UP042 枚举语义保持现状

@@ -15,15 +15,14 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import queue
 import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, asdict, field
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
 
 from ..paths import Paths
 from ..utils.logger import get_logger
@@ -165,18 +164,18 @@ class PowerShellSession:
             self._stdin_queue.put("Write-Host \"[dsh-work] terminal-ready\"" + "\n")
 
             self._stdin_writer = threading.Thread(target=self._stdin_writer_loop, daemon=True,
-                                                   name=f"ps-stdin:{session_id}")
+                                                   name=f"ps-stdin:{self.session_id}")
             self._stdout_reader = threading.Thread(target=self._reader_loop, args=("stdout",),
-                                                   daemon=True, name=f"ps-stdout:{session_id}")
+                                                   daemon=True, name=f"ps-stdout:{self.session_id}")
             self._stderr_reader = threading.Thread(target=self._reader_loop, args=("stderr",),
-                                                   daemon=True, name=f"ps-stderr:{session_id}")
+                                                   daemon=True, name=f"ps-stderr:{self.session_id}")
             self._exit_watcher = threading.Thread(target=self._exit_watcher_loop, daemon=True,
-                                                  name=f"ps-watch:{session_id}")
+                                                  name=f"ps-watch:{self.session_id}")
             self._stdin_writer.start()
             self._stdout_reader.start()
             self._stderr_reader.start()
             self._exit_watcher.start()
-            log.info("PowerShell 已启动 session=%s exe=%s cwd=%s", session_id, exe, self.cwd)
+            log.info("PowerShell 已启动 session=%s exe=%s cwd=%s", self.session_id, exe, self.cwd)
             self._emit(TerminalEvent(event="started",
                                      data=json.dumps({"exe": exe, "cwd": self.cwd},
                                                      ensure_ascii=False)))
@@ -241,7 +240,7 @@ class PowerShellSession:
                 self._history_cursor = len(self._history)
             # UI 回显输入（event: input 行）
             self._append_line(TerminalLine(kind="input", text=text + "\n"))
-        self._stdin_queue.put((text + "\n"))
+        self._stdin_queue.put(text + "\n")
 
     def history_up(self) -> str | None:
         with self._lock:

@@ -109,7 +109,7 @@ Write-Host "  暂存文件（git add .，受 .gitignore 保护）..."
 $st = (& git status --porcelain)
 if ($st) {
   Ok "暂存了 $(($st -split "`n").Count) 个文件，开始 commit..."
-  & git commit -q -m "chore: initial commit DSHWork v0.1.0 — DSH 桌面版，支持便携 Node 运行时/安装包/主题/三栏 UI/SM"
+  & git commit -q -m "chore: initial commit DSHWork v0.4.0 — DSH 桌面版，支持便携 Node 运行时/安装包/Web 版界面/深浅主题/三栏 UI"
   $log1 = (& git log --oneline -1)
   Ok "首次 commit 完成: $log1"
 } else {

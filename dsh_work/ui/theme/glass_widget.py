@@ -22,8 +22,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..theme.theme_manager import Theme
 from ...utils.logger import get_logger
+from ..theme.theme_manager import Theme
 
 log = get_logger("ui.glass_widget")
 
@@ -44,8 +44,7 @@ class FixedBackgroundScrollArea:
         Args:
             theme: 当前主题
         """
-        from PySide6.QtGui import QPixmap, QColor, QPainter
-        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QColor, QPixmap
 
         self._theme = theme
         self._background_pixmap: QPixmap | None = None
@@ -77,8 +76,8 @@ class FixedBackgroundScrollArea:
 
         将原图缩放到视口尺寸，并叠加半透明遮罩。
         """
-        from PySide6.QtGui import QPixmap, QPainter, QColor
         from PySide6.QtCore import QSize
+        from PySide6.QtGui import QColor, QPainter, QPixmap
 
         if not self._background_pixmap:
             return
@@ -142,8 +141,8 @@ class GlassWidget:
         2. 设置 widget 的背景半透明（glass_opacity）
         3. 可读性保护：背景图不透明度 > 0.4 且未开磨砂玻璃时切不透明背景
         """
-        from PySide6.QtWidgets import QGraphicsBlurEffect, QWidget
         from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QGraphicsBlurEffect, QWidget
 
         if not isinstance(widget, QWidget):
             return

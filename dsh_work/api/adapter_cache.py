@@ -37,7 +37,7 @@ class AdapterCache:
         if not self.cache_path.exists():
             return None
         try:
-            with open(self.cache_path, "r", encoding="utf-8") as f:
+            with open(self.cache_path, encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return None

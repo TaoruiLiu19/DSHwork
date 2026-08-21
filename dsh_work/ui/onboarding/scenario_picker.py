@@ -14,18 +14,18 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
+    QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QFrame,
     QSizePolicy,
-    QDialog,
+    QVBoxLayout,
+    QWidget,
 )
 
-from ...core.defaults import SCENARIO_CARDS
 from ... import constants as C
+from ...core.defaults import SCENARIO_CARDS
 
 
 class ScenarioPicker(QDialog):

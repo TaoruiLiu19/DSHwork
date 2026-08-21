@@ -31,10 +31,8 @@ from __future__ import annotations
 import os
 import re
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from .. import constants as C
 from ..utils.logger import get_logger
@@ -124,7 +122,7 @@ class UpdateInfo:
 _VERSION_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].+)?")
 
 
-def _parse(version: str) -> Optional[tuple[int, int, int, str]]:
+def _parse(version: str) -> tuple[int, int, int, str] | None:
     """解析版本号为 (major, minor, patch, pre_release)；pre_release 为空串表示正式版。"""
     if not version:
         return None
@@ -173,7 +171,7 @@ def _default_repos() -> dict[str, str]:
     }
 
 
-def _fetch_url_json(url: str, timeout: int) -> Optional[dict]:
+def _fetch_url_json(url: str, timeout: int) -> dict | None:
     """拉取 JSON，失败静默返回 None。"""
     if not url:
         return None
@@ -191,7 +189,7 @@ def _fetch_url_json(url: str, timeout: int) -> Optional[dict]:
         return None
 
 
-def _fetch_remote(timeout: int) -> Optional[tuple[dict, str]]:
+def _fetch_remote(timeout: int) -> tuple[dict, str] | None:
     """拉取远端并返回 (data_dict, source_name)。
 
     优先级：
@@ -260,7 +258,7 @@ def _parse_assets(data: dict, source: str) -> list[UpdateAsset]:
     return out
 
 
-def _parse_remote(data: dict, source: str) -> Optional[UpdateInfo]:
+def _parse_remote(data: dict, source: str) -> UpdateInfo | None:
     """解析远端 JSON → UpdateInfo；无法识别返回 None。"""
     if not isinstance(data, dict):
         return None
@@ -293,7 +291,7 @@ def _parse_remote(data: dict, source: str) -> Optional[UpdateInfo]:
     )
 
 
-def check_for_updates(timeout: int = C.UPDATE_CHECK_TIMEOUT_SEC) -> Optional[UpdateInfo]:
+def check_for_updates(timeout: int = C.UPDATE_CHECK_TIMEOUT_SEC) -> UpdateInfo | None:
     """检查是否有新版本，有则返回 UpdateInfo，否则（含失败）返回 None。
 
     非阻塞安全：所有异常被捕获，绝不抛出。
@@ -345,9 +343,9 @@ def _system32_cmd(*, win: bool) -> str:
 def write_apply_update_bat(
     *,
     new_exe: str | os.PathLike,
-    log_path: Optional[str | os.PathLike] = None,
+    log_path: str | os.PathLike | None = None,
     portable: bool = True,
-) -> Optional[Path]:
+) -> Path | None:
     """生成 apply-update.cmd（纯 ASCII，无中文，防代码页问题），返回其路径。
 
     流程（与 client-updater.js 一致）：
@@ -394,7 +392,7 @@ def write_apply_update_bat(
         "",
         "echo [%date% %time%] waiting for DSH Work to exit... >> \"%LOG%\"",
         # 等主进程退出：tasklist | find → pid 不存在即认为退出；超时 ~ 40 秒
-        f"set WAIT_ROUNDS=40",
+        "set WAIT_ROUNDS=40",
         ":wait_loop",
         f"  {SYS32}\\tasklist.exe /FI \"IMAGENAME eq {cur_exe.name}\" /NH 2>nul | {SYS32}\\find.exe /I \"{cur_exe.name}\" >nul 2>nul",
         "  if errorlevel 1 goto wait_done",
@@ -484,7 +482,8 @@ def merge_split_parts(parts: list[str | os.PathLike], out_path: str | os.PathLik
     try:
         if win:
             import subprocess
-            cmd = f"/C copy /b {' + '.join('\"' + str(p) + '\"' for p in part_paths)} \"{out_p}\""
+            parts_str = " + ".join('"' + str(p) + '"' for p in part_paths)
+            cmd = "/C copy /b " + parts_str + " \"" + str(out_p) + "\""
             proc = subprocess.run(
                 [_system32_cmd(win=True), cmd],
                 capture_output=True, text=True, timeout=120, shell=False,

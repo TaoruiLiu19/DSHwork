@@ -15,10 +15,10 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, ClassVar
-from collections.abc import Awaitable
+from typing import Any, ClassVar
 
 from .. import constants as C
 from ..utils.logger import get_logger
@@ -43,6 +43,14 @@ class WSEventType(str, Enum):
     DONE = "done"                  # 完成标志
     ERROR = "error"
     UNKNOWN = "unknown"
+    # —— Web 版高级交互事件（对齐 DSH 事件流）——
+    TODO_WRITE = "todo_write"          # 计划更新（TodoDock）
+    APPROVAL_ASKED = "approval_asked"  # 审批请求（ApprovalPanel）
+    APPROVAL_DECIDED = "approval_decided"  # 审批结果
+    APPROVAL_POLICY = "approval_policy"    # 审批策略
+    QUEUE_SPLICED = "queue_spliced"    # 队列/steer 变更（QueueDock）
+    GOAL_CHANGE = "goal_change"        # 目标变更
+    USER_MESSAGE = "user_message"      # 用户/注入消息（source.kind 区分来源）
 
 
 @dataclass
@@ -69,6 +77,13 @@ class WSMessage:
         "step/end": "step_end",
         "session/created": "session_created",
         "session/deleted": "session_deleted",
+        "todo/write": "todo_write",
+        "approval/asked": "approval_asked",
+        "approval/decided": "approval_decided",
+        "approval/policy": "approval_policy",
+        "agent/inbox/spliced": "queue_spliced",
+        "goal/change": "goal_change",
+        "user/message": "user_message",
     }
 
     @classmethod

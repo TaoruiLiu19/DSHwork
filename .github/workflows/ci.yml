@@ -1,0 +1,142 @@
+# ===== DSHWork CI/CD（完整档）=====
+#
+# 职责：
+#   1. lint   — ruff 静态检查（每次 push / PR / tag）
+#   2. test   — pytest 单元测试（Windows 实机）
+#   3. package— PyInstaller onefile + Inno Setup 安装包构建（push main / tag / 手动），产物上传 artifact
+#   4. release— 打 v* tag 时把安装包自动上传到对应 GitHub Release
+#
+# 参考：anywhere-labs/deepseek-harness-desktop 的 CI 思路（多平台打包 smoke + 产物门禁）。
+# 本项目当前仅 Windows（PySide6 + 便携 Node 均为 x64），因此只做 windows-latest 实机构建。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # release job 上传资产需要；其余 job 会自动降级为只读
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  # 打包时禁用遥测，避免 CI 中 DSH 相关进程上报
+  DSH_TELEMETRY_DISABLED: "1"
+
+jobs:
+  # ---------- 1. 静态检查 ----------
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ruff
+        run: python -m pip install "ruff>=0.5.0"
+
+      - name: Run ruff check
+        run: ruff check .
+
+  # ---------- 2. 单元测试（Windows 实机，贴近目标平台）----------
+  test:
+    name: Test (pytest, Windows)
+    needs: lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install package (editable) + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: python -m pytest -v
+
+  # ---------- 3. Windows 安装包构建 ----------
+  # push main / tag / 手动触发时构建；PR 不构建（省时），lint+test 已覆盖代码质量。
+  package:
+    name: Package (Windows installer)
+    needs: [lint, test]
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python deps
+        run: pip install -e ".[dev]"
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          # GitHub windows-latest 自带 chocolatey；安装 Inno Setup 6 供 build.ps1 调用 iscc
+          choco install innosetup --yes --no-progress
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup 6 安装后未找到 ISCC.exe" }
+          Write-Host "ISCC: $iscc"
+
+      - name: Build installer (PyInstaller + Inno Setup)
+        shell: pwsh
+        run: .\installer\build.ps1
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSHWork-Setup
+          path: |
+            installer/Output/DSHWork-Setup-*.exe
+            dist/DSHWork.exe
+          if-no-files-found: error
+
+  # ---------- 4. Release 发布：打 v* tag 时上传安装包到 GitHub Release ----------
+  release:
+    name: Release (upload to GitHub Release)
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DSHWork-Setup
+          path: artifacts
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          ls -la artifacts/
+          test -n "$(find artifacts -name 'DSHWork-Setup-*.exe' | head -1)" || { echo "缺少安装包"; exit 1; }
+          find artifacts -name '*.exe' -printf '%f %s bytes\n'
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**
+          generate_release_notes: true
+          fail_on_unmatched_files: true

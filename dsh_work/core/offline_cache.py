@@ -18,7 +18,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from .. import constants as C
 from ..config import get_offline_db_path

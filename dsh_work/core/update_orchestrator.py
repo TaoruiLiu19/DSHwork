@@ -20,12 +20,9 @@ import platform
 import re
 import shutil
 import subprocess
-import sys
-import threading
-import time
-from dataclasses import dataclass, asdict, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -508,7 +505,7 @@ def _looks_like_sha256_asset(asset: dict, chosen: dict) -> bool:
 
 
 def _url_name(url: str) -> str:
-    from urllib.parse import urlparse, unquote
+    from urllib.parse import unquote, urlparse
     path = unquote(urlparse(url).path)
     return os.path.basename(path) if path else ""
 

@@ -10,49 +10,44 @@
 from __future__ import annotations
 
 import calendar
-import os
 import re
 import time
 from pathlib import Path
-from typing import Any
 
-from PySide6.QtCore import Qt, QDate, QTimer
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import QDate, Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QGridLayout,
-    QLabel,
-    QComboBox,
-    QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
-    QHeaderView,
-    QFrame,
-    QDateEdit,
-    QDoubleSpinBox,
-    QLineEdit,
+    QAbstractItemView,
     QCheckBox,
+    QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
-    QAbstractItemView,
-    QTabWidget,
-    QTabBar,
-    QSpinBox,
-    QGroupBox,
-    QFormLayout,
+    QDoubleSpinBox,
     QFileDialog,
-    QMessageBox,
-    QSizePolicy,
-    QSpacerItem,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
     QLayout,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
     QScrollArea,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
-from ...core.usage_tracker import UsageTracker, PRICE_MODELS
-from ..theme.theme_manager import ThemeManager
+from ...core.usage_tracker import PRICE_MODELS, UsageTracker
 from ...utils.logger import get_logger
+from ..theme.theme_manager import ThemeManager
 
 log = get_logger("ui.usage_panel")
 
@@ -269,9 +264,11 @@ class _OverviewTab(QWidget):
 
     _PRESETS = ["今日", "近 7 天", "近 30 天", "全部"]
 
-    def __init__(self, tracker: UsageTracker, parent: QWidget | None = None):
+    def __init__(self, tracker: UsageTracker, parent: QWidget | None = None, default_model: str = ""):
         super().__init__(parent)
         self._tracker = tracker
+        # DSH 默认模型名（用量记录 model 为空的显示/计价兜底）
+        self._default_model = default_model or ""
         self._current_preset_idx: int = 2  # 默认「近 30 天」
         self._setup_ui()
 
@@ -392,7 +389,6 @@ class _OverviewTab(QWidget):
 
     def _refresh_cards(self) -> None:
         try:
-            preset = self._PRESETS[self._current_preset_idx]
             # 今日卡片
             today_start, _ = self._preset_time_range(0)
             today_summary = self._tracker.get_summary(start_ms=today_start)
@@ -449,8 +445,8 @@ class _OverviewTab(QWidget):
             time_str = time.strftime("%Y-%m-%d %H:%M", bj_struct)
             self._table.setItem(row, 0, QTableWidgetItem(time_str))
 
-            # 模型名
-            model_name = (rec.model or "unknown")
+            # 模型名（空模型兜底到 DSH 默认模型，避免显示 unknown）
+            model_name = rec.model or self._default_model or "unknown"
             model_item = QTableWidgetItem(model_name)
             model_item.setToolTip(model_name)
             self._table.setItem(row, 1, model_item)
@@ -470,8 +466,10 @@ class _OverviewTab(QWidget):
             # 输出
             self._table.setItem(row, 4, QTableWidgetItem(_fmt_int(rec.output_tokens)))
 
-            # 费用（使用 cost_of 计算）
+            # 费用（每个任务单独计价；空模型用默认模型兜底计算，避免全 0）
             try:
+                if not rec.model and self._default_model:
+                    rec = rec.__class__(**{**rec.__dict__, "model": self._default_model})
                 cost = self._tracker.cost_of(rec)
             except Exception:
                 cost = 0.0
@@ -818,9 +816,6 @@ class _ModelsTab(QWidget):
             f" margin-top: 10px; padding-top: 8px; background: {_TAB_PANE_BG}; }}"
             f"QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; }}"
         )
-        for mk in PRICE_MODELS:
-            parent_grp = self.findChild(QGroupBox, name="")
-            # 直接遍历 group box 子控件
         for c in self.findChildren(QGroupBox):
             c.setStyleSheet(grp_style)
 
@@ -1662,11 +1657,16 @@ class _SettingsTab(QWidget):
 class UsagePanel(QWidget):
     """用量与消耗主面板（QTabWidget 承载 4 个标签页）。"""
 
-    def __init__(self, tracker: UsageTracker, balance_widget=None, parent: QWidget | None = None):
+    back_requested = Signal()  # 返回对话视图
+
+    def __init__(self, tracker: UsageTracker, balance_widget=None, parent: QWidget | None = None,
+                 default_model: str = ""):
         super().__init__(parent)
         self.setObjectName("UsagePanel")
         self._tracker = tracker
         self._balance_widget = balance_widget
+        # DSH 默认模型名（用量记录 model 为空的显示/计价兜底）
+        self._default_model = default_model or ""
 
         self._overview_tab: _OverviewTab | None = None
         self._models_tab: _ModelsTab | None = None
@@ -1703,11 +1703,25 @@ class UsagePanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # 顶部：返回对话入口（用量面板全屏占中央列，必须能回到对话）
+        header = QHBoxLayout()
+        header.setContentsMargins(12, 8, 12, 4)
+        self._back_btn = QPushButton("← 返回对话")
+        self._back_btn.setObjectName("HeaderBtn")
+        self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._back_btn.clicked.connect(self.back_requested)
+        header.addWidget(self._back_btn)
+        title = QLabel("用量与消耗")
+        title.setObjectName("ConversationTitle")
+        header.addWidget(title)
+        header.addStretch()
+        layout.addLayout(header)
+
         self._tab_widget = QTabWidget()
         self._tab_widget.setTabPosition(QTabWidget.TabPosition.North)
         self._tab_widget.setDocumentMode(False)
 
-        self._overview_tab = _OverviewTab(self._tracker)
+        self._overview_tab = _OverviewTab(self._tracker, default_model=getattr(self, "_default_model", ""))
         self._tab_widget.addTab(self._overview_tab, "概览")
 
         self._models_tab = _ModelsTab(self._tracker)

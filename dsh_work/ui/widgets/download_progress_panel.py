@@ -11,18 +11,18 @@ UI 组件：
 from __future__ import annotations
 
 import threading
-from typing import Callable
+from collections.abc import Callable
 
-from PySide6.QtCore import Qt, QTimer, QRectF
-from PySide6.QtGui import QPainter, QPen, QColor, QFont, QConicalGradient
+from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QConicalGradient, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QWidget,
     QDialog,
-    QVBoxLayout,
+    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
-    QHBoxLayout,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ...utils.logger import get_logger

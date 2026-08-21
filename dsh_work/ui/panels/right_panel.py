@@ -9,15 +9,15 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
     QHBoxLayout,
     QLabel,
-    QPushButton,
-    QTabWidget,
-    QStackedWidget,
     QListWidget,
     QListWidgetItem,
+    QPushButton,
+    QStackedWidget,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ... import constants as C
@@ -90,7 +90,7 @@ class DiffView(QListWidget):
         """显示 diff 文本。"""
         self.clear()
         for line in diff_text.splitlines():
-            from PySide6.QtGui import QColor, QBrush
+            from PySide6.QtGui import QBrush, QColor
             item = QListWidgetItem(line)
             if line.startswith("+") and not line.startswith("+++"):
                 item.setForeground(QBrush(QColor("#33C192")))

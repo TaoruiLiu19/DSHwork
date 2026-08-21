@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
 
 from ..utils.logger import get_logger
 
@@ -60,7 +60,7 @@ def is_dangerous_ext(path: str | os.PathLike) -> bool:
 # ============================================================================
 # 允许根目录校验（防止绝对路径跳出会话 cwd）
 # ============================================================================
-def _resolve_abs(path: str | os.PathLike) -> Optional[str]:
+def _resolve_abs(path: str | os.PathLike) -> str | None:
     """把路径转成绝对的 realpath；失败返回 None（不抛，避免误拦截）。"""
     try:
         p = Path(os.fspath(path)).expanduser().resolve()
@@ -202,7 +202,7 @@ def can_write_workspace(
 # ============================================================================
 
 
-def parse_href_path(href: str, *, base_dir: str | os.PathLike = "") -> Optional[str]:
+def parse_href_path(href: str, *, base_dir: str | os.PathLike = "") -> str | None:
     """从 href 字符串里解析出本地路径，不合法/非本地返回 None。
 
     支持：

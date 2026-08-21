@@ -11,16 +11,16 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, QObject, Signal, QUrl
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import constants as C
-from .api import DshService, CompatibilityMode
+from .api import CompatibilityMode, DshService
 from .config import UserConfig, ensure_dirs, get_dsh_sessions_dir
 from .core.process_manager import ProcessManager
 from .core.session_watcher import SessionWatcher, TurnEndEvent
-from .core.update_checker import check_for_updates, UpdateInfo
+from .core.update_checker import UpdateInfo, check_for_updates
 from .ui.main_window import MainWindow
 from .ui.onboarding.scenario_picker import ScenarioPicker
 from .ui.onboarding.splash_screen import SplashScreen

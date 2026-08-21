@@ -12,12 +12,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QFrame,
     QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ...core.defaults import EMPTY_STATE_CARDS
@@ -100,7 +100,7 @@ class EmptyStateCards(QWidget):
         # 描述
         desc = QLabel(card_data["description"])
         desc.setObjectName("Secondary")
-        desc.setStyleSheet("font-size: 12px; color: #9599A6;")
+        desc.setStyleSheet("font-size: 12px;")  # 颜色由全局 QSS #Secondary 主题化控制
         desc.setWordWrap(True)
         layout.addWidget(desc)
 

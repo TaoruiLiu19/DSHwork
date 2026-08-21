@@ -7,7 +7,7 @@
 4. 开始工作（直接进入主窗口）
 """
 
-from .splash_screen import SplashScreen
 from .scenario_picker import ScenarioPicker
+from .splash_screen import SplashScreen
 
 __all__ = ["SplashScreen", "ScenarioPicker"]

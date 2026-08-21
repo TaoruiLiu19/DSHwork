@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import os
 
-from .. import constants as C
-
 
 def setup_high_dpi() -> None:
     """在 QApplication 实例化之前设置高 DPI 缩放策略。

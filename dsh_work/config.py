@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -176,9 +176,24 @@ class UserConfig:
             cfg.save()
             return cfg
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            return cls.from_dict(data)
+            cfg = cls.from_dict(data)
+            # v0.4 迁移：旧内置主题名（midnight_ocean/daylight/qinghua/forest_green）
+            # → Web 版深浅主题，避免配置指向已移除的主题。
+            legacy = {
+                "midnight_ocean": C.DEFAULT_THEME,
+                "forest_green": C.DEFAULT_THEME,
+                "qinghua": C.DEFAULT_THEME,
+                "daylight": "web_light",
+            }
+            if cfg.theme in legacy and legacy[cfg.theme] != cfg.theme:
+                cfg.theme = legacy[cfg.theme]
+                try:
+                    cfg.save()
+                except OSError:
+                    pass
+            return cfg
         except (json.JSONDecodeError, OSError):
             # 配置损坏时回退默认，不崩溃
             cfg = cls()

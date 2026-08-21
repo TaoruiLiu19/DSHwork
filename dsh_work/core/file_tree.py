@@ -23,11 +23,10 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Iterable
 from typing import Any
 
 from ..utils.logger import get_logger
@@ -44,14 +43,14 @@ class FileTreeNode:
     """文件树节点（文件或目录）。"""
 
     path: Path
-    parent: "FileTreeNode | None" = None
+    parent: FileTreeNode | None = None
     is_dir: bool = False
     size: int = 0
     mtime: float = 0.0
     children_loaded: bool = False
     expanded: bool = False
     # 子节点（加载后填充，按 目录优先 → 字母序 排序）
-    children: list["FileTreeNode"] = field(default_factory=list)
+    children: list[FileTreeNode] = field(default_factory=list)
     # 扩展名/图标键缓存（path 创建后不可变，缓存安全；避免渲染时光标/扩展名反复计算）
     _ext_cache: str = field(default="", init=False, repr=False)
     _icon_cache: str = field(default="", init=False, repr=False)
@@ -739,7 +738,7 @@ class HtmlPreviewServer:
 
     def _send_error(self, handler: BaseHTTPRequestHandler, code: int, msg: str,
                     head_only: bool) -> None:
-        body = f"<h3>{code} Preview Error</h3><p>{msg}</p>".encode("utf-8")
+        body = f"<h3>{code} Preview Error</h3><p>{msg}</p>".encode()
         handler.send_response(code)
         handler.send_header("Content-Type", "text/html; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))

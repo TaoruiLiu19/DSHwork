@@ -16,12 +16,10 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QLabel,
     QFrame,
-    QToolButton,
-    QSizePolicy,
+    QLabel,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ... import constants as C
@@ -54,11 +52,13 @@ class InlinePreview(QFrame):
         header_layout.setSpacing(2)
 
         self._title_label = QLabel("预览")
-        self._title_label.setStyleSheet("font-size: 12px; color: #9599A6; font-weight: 600;")
+        self._title_label.setObjectName("Secondary")  # 颜色走全局 QSS 主题化
+        self._title_label.setStyleSheet("font-size: 12px; font-weight: 600;")
         header_layout.addWidget(self._title_label)
 
         self._type_label = QLabel("")
-        self._type_label.setStyleSheet("font-size: 11px; color: #666B75;")
+        self._type_label.setObjectName("Muted")  # 颜色走全局 QSS 主题化
+        self._type_label.setStyleSheet("font-size: 11px;")
         header_layout.addWidget(self._type_label)
         layout.addLayout(header_layout)
 
@@ -123,7 +123,7 @@ class InlinePreview(QFrame):
         label.setTextFormat(Qt.TextFormat.MarkdownText)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, encoding="utf-8") as f:
                 label.setText(f.read())
         except OSError:
             label.setText("无法读取文件")
@@ -135,8 +135,9 @@ class InlinePreview(QFrame):
         self._clear_content()
         try:
             import csv
+
             from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, encoding="utf-8") as f:
                 reader = csv.reader(f)
                 rows = list(reader)
             table = QTableWidget()
@@ -159,8 +160,9 @@ class InlinePreview(QFrame):
         self._clear_content()
         try:
             import json
-            from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
-            with open(file_path, "r", encoding="utf-8") as f:
+
+            from PySide6.QtWidgets import QTreeWidget
+            with open(file_path, encoding="utf-8") as f:
                 data = json.load(f)
             tree = QTreeWidget()
             tree.setHeaderHidden(True)
@@ -239,7 +241,7 @@ class InlinePreview(QFrame):
         editor = QPlainTextEdit()
         editor.setReadOnly(True)
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, encoding="utf-8") as f:
                 editor.setPlainText(f.read())
         except OSError:
             editor.setPlainText("无法读取文件")
